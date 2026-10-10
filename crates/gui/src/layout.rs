@@ -88,6 +88,8 @@ pub struct Control {
     /// None = on every page.
     pub page: Option<Page>,
     pub kind: Kind,
+    /// Only shown while the discrete parameter `.0` is at item `.1` (effect parameters).
+    pub when: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,12 +112,14 @@ impl Layout {
     pub fn push(&mut self, page: Option<Page>, r: R, kind: Kind) {
         match &kind {
             Kind::Fader { origin, .. } => self.decos.push((page, Deco::FaderSlot { r, origin: *origin })),
-            Kind::Knob { radius, .. } => {
-                self.decos.push((page, Deco::KnobRing { cx: r.cx(), cy: r.y + radius + 6.0, radius: *radius }))
-            }
             _ => {}
         }
-        self.controls.push(Control { r, page, kind });
+        self.controls.push(Control { r, page, kind, when: None });
+    }
+
+    /// Adds a control that is only visible while `addr` is at item `index`.
+    pub fn push_when(&mut self, page: Option<Page>, r: R, kind: Kind, addr: usize, index: usize) {
+        self.controls.push(Control { r, page, kind, when: Some((addr, index)) });
     }
 
     pub fn deco(&mut self, page: Option<Page>, d: Deco) {

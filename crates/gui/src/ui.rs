@@ -120,6 +120,56 @@ pub struct Ui {
     pub library: pages::library::Library,
     pub page_state: pages::State,
     pub status: Option<(String, Instant)>,
+    last: Frame,
+    had_overlay: bool,
+    force_full: bool,
+    focus_shown: bool,
+}
+
+/// Signatures of what the last frame showed.
+#[derive(Default)]
+struct Frame {
+    sigs: Vec<u64>,
+    display: u64,
+    page: u64,
+    size: (u32, u32),
+}
+
+/// FNV-1a style signature builder.
+pub struct Sig(pub u64);
+
+impl Sig {
+    pub fn new() -> Self {
+        Sig(0xcbf2_9ce4_8422_2325)
+    }
+    pub fn add(&mut self, v: u64) {
+        self.0 ^= v;
+        self.0 = self.0.wrapping_mul(0x0000_0100_0000_01B3);
+        self.0 ^= self.0 >> 29;
+    }
+    pub fn str(&mut self, s: &str) {
+        for b in s.bytes() {
+            self.add(b as u64);
+        }
+        self.add(0xFF);
+    }
+}
+
+impl Default for Sig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Area a control may paint (shadows, glows, value labels).
+fn bounds(c: &Control) -> R {
+    match c.kind {
+        Kind::Fader { .. } => c.r.inset_xy(-16.0, -6.0),
+        Kind::Knob { .. } => c.r.inset(-6.0),
+        Kind::Bender | Kind::ModWheel => R::new(c.r.x - 8.0, c.r.y - 4.0, c.r.w + 12.0, c.r.h + 20.0),
+        Kind::Keyboard => c.r.inset(-2.0),
+        _ => c.r.inset(-4.0),
+    }
 }
 
 impl Ui {
@@ -149,6 +199,10 @@ impl Ui {
             library: pages::library::Library::default(),
             page_state: pages::State::default(),
             status: None,
+            last: Frame::default(),
+            had_overlay: false,
+            force_full: true,
+            focus_shown: false,
         }
     }
 
@@ -165,9 +219,16 @@ impl Ui {
         self.dirty = true;
     }
 
+    /// The next render redraws everything (the target buffer is new or was overwritten).
+    pub fn invalidate_all(&mut self) {
+        self.force_full = true;
+        self.dirty = true;
+    }
+
     pub fn invalidate_background(&mut self) {
         self.bg = None;
         self.dirty = true;
+        self.force_full = true;
     }
 
     pub fn set_status(&mut self, s: impl Into<String>) {
@@ -217,6 +278,11 @@ impl Ui {
         if self.library.poll() {
             self.dirty = true;
         }
+        let shown = display::focus(self).is_some();
+        if shown != self.focus_shown {
+            self.focus_shown = shown;
+            self.dirty = true;
+        }
         let d = self.dirty;
         d
     }
@@ -227,6 +293,7 @@ impl Ui {
 
     fn visible(&self, c: &Control) -> bool {
         c.page.map_or(true, |p| p == self.page)
+            && c.when.map_or(true, |(addr, i)| PARAMS[addr].index_f32(self.values[addr].max(0.0)) == i)
     }
 
     fn hit(&self, x: f32, y: f32) -> Option<usize> {
@@ -319,6 +386,7 @@ impl Ui {
                             self.bend = 0.0;
                             host.midi(0xE0, 0, 64);
                         }
+                        Drag::Page(id) => pages::area_up(self, host, id),
                         _ => {}
                     }
                     self.hover = self.hit(x, y);
@@ -602,7 +670,8 @@ impl Ui {
 
     // MARK: - rendering
 
-    /// Draws the whole editor. `canvas.scale` must be backing scale × zoom.
+    /// Draws the editor. `canvas.scale` must be backing scale × zoom. The canvas must keep the
+    /// previous frame: only regions whose state changed are redrawn.
     pub fn render(&mut self, host: &dyn Host, c: &mut Canvas) {
         let key = (self.page, c.scale);
         let stale = !matches!(&self.bg, Some((p, s, pm)) if *p == key.0 && *s == key.1 && pm.width() == c.pix.width() && pm.height() == c.pix.height());
@@ -615,41 +684,206 @@ impl Ui {
                 self.bg = Some((self.page, c.scale, pm));
             }
         }
-        if let Some((_, _, pm)) = &self.bg {
-            c.blit_all(pm.as_ref());
+        let sigs: Vec<u64> = (0..self.layout.controls.len()).map(|i| self.control_sig(host, i)).collect();
+        let disp = self.display_sig(host);
+        let page = self.page_sig(host);
+        let overlay = self.menu.is_some() || self.status.is_some();
+        let full = stale || self.force_full || overlay || self.had_overlay || self.last.sigs.len() != sigs.len() || self.last.size != (c.pix.width(), c.pix.height());
+        if full {
+            if let Some((_, _, pm)) = &self.bg {
+                c.blit_all(pm.as_ref());
+            }
+            self.draw_all(host, c);
+        } else {
+            let mut regions: Vec<R> = Vec::new();
+            let body_page = self.page != Page::Synth;
+            let mut body_dirty = body_page && page != self.last.page;
+            for (i, sig) in sigs.iter().enumerate() {
+                if *sig != self.last.sigs[i] {
+                    let ctl = &self.layout.controls[i];
+                    let b = bounds(ctl);
+                    if body_page && ctl.page.is_some() {
+                        // page controls share the area with dynamic page content
+                        body_dirty = true;
+                    } else {
+                        regions.push(b);
+                    }
+                }
+            }
+            if body_dirty {
+                regions.push(layout::BODY.inset(-4.0));
+            }
+            let disp_dirty = disp != self.last.display;
+            if disp_dirty {
+                regions.push(layout::display_rect().inset(-2.0));
+            }
+            // grow every region over the controls it touches so nothing is composited twice
+            let regions = self.close_regions(regions);
+            for r in &regions {
+                if let Some((_, _, pm)) = &self.bg {
+                    c.blit_region(pm.as_ref(), *r);
+                }
+                for i in 0..self.layout.controls.len() {
+                    let ctl = &self.layout.controls[i];
+                    if self.visible(ctl) && bounds(ctl).intersects(r) {
+                        self.draw_one(host, c, i);
+                    }
+                }
+                if body_page && r.intersects(&layout::BODY.inset(4.0)) {
+                    pages::draw(self, host, c);
+                }
+                if r.intersects(&layout::display_rect()) {
+                    display::draw(self, host, c, layout::display_rect());
+                }
+            }
         }
-        self.draw_dynamic(host, c);
+        self.last = Frame { sigs, display: disp, page, size: (c.pix.width(), c.pix.height()) };
+        self.had_overlay = overlay;
+        self.force_full = false;
         self.dirty = false;
     }
 
-    fn draw_background(&self, c: &mut Canvas) {
-        c.rect(R::new(0.0, 0.0, layout::W, layout::H), t::WINDOW);
-        // header
-        let hr = R::new(0.0, 0.0, layout::W, layout::HEADER_H);
-        c.rect(hr, vgrad(0.0, hr.h, t::HEADER_TOP, t::HEADER_BOTTOM));
-        c.hline(0.0, layout::W, layout::HEADER_H - 1.0, 1.0, Rgba::black(0.9));
-        c.hline(0.0, layout::W, layout::HEADER_H, 1.0, Rgba::white(0.05));
-        draw_logo(c, 20.0, 31.0);
-        display::draw_static(c, layout::display_rect());
-        // body
-        for (p, d) in &self.layout.decos {
-            if p.map_or(true, |p| p == self.page) {
-                draw_deco(c, d);
+    fn close_regions(&self, mut regions: Vec<R>) -> Vec<R> {
+        loop {
+            let mut changed = false;
+            for r in regions.iter_mut() {
+                for ctl in &self.layout.controls {
+                    if !self.visible(ctl) {
+                        continue;
+                    }
+                    let b = bounds(ctl);
+                    if b.intersects(r) {
+                        let u = r.union(&b);
+                        if u != *r {
+                            *r = u;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            // merge overlapping regions
+            let mut merged: Vec<R> = Vec::new();
+            for r in regions {
+                if let Some(m) = merged.iter_mut().find(|m| m.intersects(&r)) {
+                    *m = m.union(&r);
+                    changed = true;
+                } else {
+                    merged.push(r);
+                }
+            }
+            regions = merged;
+            if !changed {
+                return regions;
             }
         }
-        pages::draw_background(self, c);
     }
 
-    fn draw_dynamic(&mut self, host: &dyn Host, c: &mut Canvas) {
-        let n = self.layout.controls.len();
-        for i in 0..n {
-            let ctl = &self.layout.controls[i];
-            if !self.visible(ctl) {
-                continue;
+    fn control_sig(&self, host: &dyn Host, i: usize) -> u64 {
+        let ctl = &self.layout.controls[i];
+        if !self.visible(ctl) {
+            return 0;
+        }
+        let mut h = Sig::new();
+        h.add(1);
+        let hover = self.hover == Some(i) && self.menu.is_none();
+        h.add(hover as u64);
+        h.add(matches!(&self.drag, Some(Drag::Value { ctl, .. }) if *ctl == i) as u64);
+        if let Some(addr) = ctl.kind.addr() {
+            h.add(host.get(addr).to_bits() as u64);
+            h.add(inactive(addr, host) as u64);
+            if hover {
+                if let Kind::Switch { .. } = ctl.kind {
+                    h.add(self.mouse.0.to_bits() as u64);
+                    h.add(self.mouse.1.to_bits() as u64);
+                }
             }
-            let hover = self.hover == Some(i) && self.menu.is_none();
-            let active = matches!(&self.drag, Some(Drag::Value { ctl, .. }) if *ctl == i);
-            draw_control(self, host, c, ctl, hover, active);
+        }
+        match &ctl.kind {
+            Kind::Keyboard => h.add(self.held_note.map_or(999, |n| n as u64)),
+            Kind::Bender => h.add(self.bend.to_bits() as u64),
+            Kind::ModWheel => h.add(self.mod_wheel.to_bits() as u64),
+            Kind::Tab(p) => h.add((self.page == *p) as u64),
+            Kind::Zoom => h.add(self.zoom as u64),
+            _ => {}
+        }
+        h.0
+    }
+
+    fn display_sig(&self, host: &dyn Host) -> u64 {
+        let mut h = Sig::new();
+        h.str(&self.patch_name);
+        h.str(&self.patch_bank);
+        h.add(self.is_modified() as u64);
+        match display::focus(self) {
+            Some(addr) => {
+                h.add(addr as u64 + 1);
+                // the graph may depend on the whole group
+                let g = PARAMS[addr].group;
+                for (i, p) in PARAMS.iter().enumerate() {
+                    if p.group == g || addr == i {
+                        h.add(host.get(i).to_bits() as u64);
+                    }
+                }
+                if matches!(g, jovian_core::params::Group::Vcf | jovian_core::params::Group::Vco) {
+                    for a in [jovian_core::params::addr::LpfCut, jovian_core::params::addr::LpfRes, jovian_core::params::addr::LpfSlop, jovian_core::params::addr::HPF_Cutoff] {
+                        h.add(host.get(a).to_bits() as u64);
+                    }
+                }
+            }
+            None => {
+                let m = self.meters;
+                h.add(m.active_voices as u64);
+                h.add(m.gated_voices as u64);
+                h.add((m.lfo * 20.0) as i64 as u64);
+                h.add((m.env1 * 60.0) as i64 as u64);
+                h.add((m.env2 * 60.0) as i64 as u64);
+            }
+        }
+        h.0
+    }
+
+    fn page_sig(&self, host: &dyn Host) -> u64 {
+        if self.page == Page::Synth {
+            return 0;
+        }
+        let mut h = Sig::new();
+        for i in 0..COUNT {
+            h.add(host.get(i).to_bits() as u64);
+        }
+        h.add(self.library.signature());
+        h.add(self.mouse.0.to_bits() as u64);
+        h.add(self.mouse.1.to_bits() as u64);
+        h.add(self.page_state.curve_drag.map_or(0, |(a, b)| (a * 8 + b + 1) as u64));
+        h.add(self.page_state.eq_drag.map_or(0, |(a, b)| (a * 8 + b + 1) as u64));
+        for s in 0..3 {
+            h.add((host.compressor_reduction(s) * 4.0) as i64 as u64);
+        }
+        h.str(&self.patch_name);
+        h.0
+    }
+
+    fn draw_one(&self, host: &dyn Host, c: &mut Canvas, i: usize) {
+        let ctl = &self.layout.controls[i];
+        let hover = self.hover == Some(i) && self.menu.is_none();
+        let active = matches!(&self.drag, Some(Drag::Value { ctl, .. }) if *ctl == i);
+        draw_control(self, host, c, ctl, hover, active);
+        if let Some(addr) = ctl.kind.addr() {
+            if inactive(addr, host) && !active {
+                // controls that currently have no effect are veiled, like a dimmed panel label
+                let r = match ctl.kind {
+                    Kind::Fader { .. } => ctl.r.inset_xy(-4.0, -2.0),
+                    _ => ctl.r.inset(-1.0),
+                };
+                c.rrect(r, 3.0, Rgba::hex(0x1F1F22).with_alpha(0.62));
+            }
+        }
+    }
+
+    fn draw_all(&mut self, host: &dyn Host, c: &mut Canvas) {
+        for i in 0..self.layout.controls.len() {
+            if self.visible(&self.layout.controls[i]) {
+                self.draw_one(host, c, i);
+            }
         }
         pages::draw(self, host, c);
         display::draw(self, host, c, layout::display_rect());
@@ -667,6 +901,27 @@ impl Ui {
         }
     }
 
+    fn draw_background(&self, c: &mut Canvas) {
+        c.rect(R::new(0.0, 0.0, layout::W, layout::H), t::WINDOW);
+        // header
+        let hr = R::new(0.0, 0.0, layout::W, layout::HEADER_H);
+        c.rect(hr, vgrad(0.0, hr.h, t::HEADER_TOP, t::HEADER_BOTTOM));
+        c.hline(0.0, layout::W, layout::HEADER_H - 1.0, 1.0, Rgba::black(0.9));
+        c.hline(0.0, layout::W, layout::HEADER_H, 1.0, Rgba::white(0.05));
+        draw_logo(c, 20.0, 31.0);
+        display::draw_static(c, layout::display_rect());
+        if let Some(k) = self.layout.controls.iter().find(|k| k.kind == Kind::Keyboard) {
+            keyboard_static(c, k.r);
+        }
+        // body
+        for (p, d) in &self.layout.decos {
+            if p.map_or(true, |p| p == self.page) {
+                draw_deco(c, d);
+            }
+        }
+        pages::draw_background(self, c);
+    }
+
     pub fn hovered(&self) -> Option<&Control> {
         self.hover.map(|i| &self.layout.controls[i])
     }
@@ -680,6 +935,54 @@ impl Ui {
 
     pub fn is_dragging(&self) -> bool {
         self.drag.is_some()
+    }
+}
+
+/// True when a parameter currently has no effect (its mode switch points elsewhere).
+pub fn inactive(addr: usize, host: &dyn Host) -> bool {
+    use jovian_core::params::addr as a;
+    let idx = |x: usize| index_of(host, x);
+    match addr {
+        a::LFO_RateUnSynced => idx(a::LFO_MidiSync) == 1,
+        a::LFO_RateSynced => idx(a::LFO_MidiSync) == 0,
+        a::ArpSeq_RateUnSynced => idx(a::ArpSeq_MidiSync) == 1,
+        a::ArpSeq_RateSynced => idx(a::ArpSeq_MidiSync) == 0,
+        a::LFO1_RateUnSynced => idx(a::LFO1_RateMode) != 0,
+        a::LFO1_RateSynced => idx(a::LFO1_RateMode) == 0,
+        a::LFO2_RateUnSynced => idx(a::LFO2_RateMode) != 0,
+        a::LFO2_RateSynced => idx(a::LFO2_RateMode) == 0,
+        a::UniVPN | a::VoiceDetuneAmount => idx(a::AssignMode) != 1,
+        a::Polyphon => idx(a::AssignMode) == 0,
+        a::PlPrio => idx(a::AssignMode) >= 2,
+        a::Portamento_Time => idx(a::Portamento_On) == 0,
+        a::BendVCFAmount => idx(a::BendVCF) == 0,
+        a::LfoModVCOAmount => idx(a::LfoModVCO) == 0,
+        a::LfoModVcfAmount => idx(a::LfoModVCF) == 0,
+        _ => {
+            let id = PARAMS[addr].id;
+            if let Some(rest) = id.strip_prefix("ModMatrixAmount_Src") {
+                // amount of a matrix slot without destination
+                let d = rest.split("_Dest").nth(1).unwrap_or("");
+                return jovian_core::params::address(&format!("ModMatrixDest{d}")).is_some_and(|da| idx(da) == 0);
+            }
+            if id.len() > 4 && id.starts_with("FX") && &id[3..4] == "_" {
+                let fx = |sfx: &str| jovian_core::params::address(&format!("{}{}", &id[..4], sfx)).map(idx).unwrap_or(0);
+                return match &id[4..] {
+                    "Delay_DelayTimeMs" => fx("Delay_MidiSync") == 1,
+                    "Delay_DelayTimeSynced" | "Delay_RateSyncedType" => fx("Delay_MidiSync") == 0,
+                    "Delay_StereoWidth" => fx("Delay_StereoMode") == 1,
+                    "Delay_StereoWidthPP" => fx("Delay_StereoMode") == 0,
+                    "Phaser_LFO_RateUnSynced" => fx("Phaser_LFO_MidiSync") == 1,
+                    "Phaser_LFO_RateSynced" | "Phaser_LFO_RateSyncedType" => fx("Phaser_LFO_MidiSync") == 0,
+                    "StereoPan_LFOSimple_RateUnSynced" => fx("StereoPan_LFOSimple_RateType") != 0,
+                    "StereoPan_LFOSimple_RateSynced" => fx("StereoPan_LFOSimple_RateType") == 0,
+                    "MultiModeFilter_CombFreq" => fx("MultiModeFilter_Mode") < 3,
+                    "MultiModeFilter_Freq" | "MultiModeFilter_Slope" => fx("MultiModeFilter_Mode") >= 3,
+                    _ => false,
+                };
+            }
+            false
+        }
     }
 }
 
@@ -766,7 +1069,7 @@ fn draw_deco(c: &mut Canvas, d: &Deco) {
 
 /// Note and velocity under a point of the keyboard.
 pub fn key_at(r: R, x: f32, y: f32) -> Option<(u8, u8)> {
-    let keys = keyboard_keys(r);
+    let keys = drawn_keys(r);
     // black keys first (they are on top)
     for (note, kr, black) in keys.iter().filter(|k| k.2).chain(keys.iter().filter(|k| !k.2)) {
         if kr.contains(x, y) {
@@ -833,6 +1136,7 @@ fn draw_control(ui: &Ui, host: &dyn Host, c: &mut Canvas, ctl: &Control, hover: 
         Kind::Knob { addr, label, color, bipolar, radius } => {
             let v = host.get(*addr);
             let cy = r.y + radius + 6.0;
+            w::knob_static(c, r.cx(), cy, *radius);
             w::knob(c, r.cx(), cy, *radius, v, *color, *bipolar, hover, active);
             let ly = cy + radius + 18.0;
             if hover || active {
@@ -920,39 +1224,66 @@ fn draw_wheel(c: &mut Canvas, r: R, v: f32, center: bool, hover: bool, label: &s
     c.text(label, r.cx(), r.bottom() + 13.0, &Style::new(Face::CondSemi, 8.5, 0.6), t::INK_DIM, 0.5);
 }
 
-fn draw_keyboard(ui: &Ui, c: &mut Canvas, r: R) {
-    // case and felt strip
+/// Key rectangles as drawn: (note, rect, is_black).
+fn drawn_keys(r: R) -> Vec<(u8, R, bool)> {
+    keyboard_keys(keybed(r))
+        .into_iter()
+        .map(|(n, kr, black)| if black { (n, R::new(kr.x, kr.y + 4.0, kr.w, kr.h), true) } else { (n, R::new(kr.x + 0.5, kr.y + 4.0, kr.w - 1.0, kr.h - 10.0), false) })
+        .collect()
+}
+
+/// The keybed inside the keyboard control.
+pub fn keybed(r: R) -> R {
+    r.inset_xy(10.0, 0.0).offset(0.0, 4.0)
+}
+
+fn white_key(c: &mut Canvas, n: u8, kr: R, down: bool) {
+    let (a, b) = if down { (Rgba::hex(0xD9D6CD), Rgba::hex(0xC9C5BA)) } else { (Rgba::hex(0xF4F2EC), Rgba::hex(0xDCD9D0)) };
+    c.rrect(kr, 3.0, vgrad(kr.y, kr.bottom(), a, b));
+    c.rrect_stroke(kr, 3.0, 0.75, Rgba::black(0.45));
+    if down {
+        c.rrect(R::new(kr.x + 2.0, kr.bottom() - 10.0, kr.w - 4.0, 6.0), 2.0, t::ORANGE.with_alpha(0.85));
+    }
+    if n % 12 == 0 {
+        let st = Style::new(Face::CondSemi, 8.0, 0.4);
+        c.text(&format!("C{}", n as i32 / 12 - 1), kr.cx(), kr.bottom() - 6.0, &st, Rgba::black(0.45), 0.5);
+    }
+}
+
+fn black_key(c: &mut Canvas, kr: R, down: bool) {
+    c.shadow(kr, 2.5, 3.0, 2.0, Rgba::black(0.6));
+    let (a, b) = if down { (Rgba::hex(0x2A2A2E), Rgba::hex(0x1A1A1D)) } else { (Rgba::hex(0x35353A), Rgba::hex(0x0E0E10)) };
+    c.rrect(kr, 2.5, vgrad(kr.y, kr.bottom(), a, b));
+    c.rrect(R::new(kr.x + 2.0, kr.bottom() - 7.0, kr.w - 4.0, 4.0), 1.5, if down { t::ORANGE } else { Rgba::white(0.08) });
+}
+
+fn keyboard_static(c: &mut Canvas, r: R) {
     c.rrect(r, 6.0, vgrad(r.y, r.bottom(), Rgba::hex(0x1F1F22), Rgba::hex(0x151517)));
     c.rrect_stroke(r, 6.0, 1.0, Rgba::black(0.7));
-    let keys = keyboard_keys(r.inset_xy(10.0, 0.0).offset(0.0, 4.0));
     let felt = R::new(r.x + 10.0, r.y + 8.0, r.w - 20.0, 3.0);
     c.rect(felt, Rgba::hex(0x7A1E17));
-    let held = ui.held_note;
-    let gated = ui.meters.gated_voices;
-    let _ = gated;
-    for (n, kr, black) in keys.iter().filter(|k| !k.2) {
-        let _ = black;
-        let down = held == Some(*n);
-        let kr = R::new(kr.x + 0.5, kr.y + 4.0, kr.w - 1.0, kr.h - 10.0);
-        let (a, b) = if down { (Rgba::hex(0xD9D6CD), Rgba::hex(0xC9C5BA)) } else { (Rgba::hex(0xF4F2EC), Rgba::hex(0xDCD9D0)) };
-        c.rrect(kr, 3.0, vgrad(kr.y, kr.bottom(), a, b));
-        c.rrect_stroke(kr, 3.0, 0.75, Rgba::black(0.45));
-        if down {
-            c.rrect(R::new(kr.x + 2.0, kr.bottom() - 10.0, kr.w - 4.0, 6.0), 2.0, t::ORANGE.with_alpha(0.85));
-        }
-        if n % 12 == 0 {
-            let st = Style::new(Face::CondSemi, 8.0, 0.4);
-            c.text(&format!("C{}", *n as i32 / 12 - 1), kr.cx(), kr.bottom() - 6.0, &st, Rgba::black(0.45), 0.5);
-        }
+    let keys = drawn_keys(r);
+    for (n, kr, _) in keys.iter().filter(|k| !k.2) {
+        white_key(c, *n, *kr, false);
     }
-    for (n, kr, _) in keys.iter().filter(|k| k.2) {
-        let down = held == Some(*n);
-        let kr = R::new(kr.x, kr.y + 4.0, kr.w, kr.h);
-        c.shadow(kr, 2.5, 3.0, 2.0, Rgba::black(0.6));
-        let (a, b) = if down { (Rgba::hex(0x2A2A2E), Rgba::hex(0x1A1A1D)) } else { (Rgba::hex(0x35353A), Rgba::hex(0x0E0E10)) };
-        c.rrect(kr, 2.5, vgrad(kr.y, kr.bottom(), a, b));
-        c.rrect(R::new(kr.x + 2.0, kr.bottom() - 7.0, kr.w - 4.0, 4.0), 1.5, if down { t::ORANGE } else { Rgba::white(0.08) });
+    for (_, kr, _) in keys.iter().filter(|k| k.2) {
+        black_key(c, *kr, false);
     }
-    // top shadow under the felt
     c.rect(R::new(r.x + 10.0, r.y + 11.0, r.w - 20.0, 6.0), vgrad(r.y + 11.0, r.y + 17.0, Rgba::black(0.45), Rgba::black(0.0)));
+}
+
+fn draw_keyboard(ui: &Ui, c: &mut Canvas, r: R) {
+    // the keyboard is part of the background; only a held key is drawn on top
+    let Some(held) = ui.held_note else { return };
+    let keys = drawn_keys(r);
+    let Some((_, kr, black)) = keys.iter().find(|k| k.0 == held).copied() else { return };
+    if black {
+        black_key(c, kr, true);
+    } else {
+        white_key(c, held, kr, true);
+        for (_, br, _) in keys.iter().filter(|k| k.2 && k.1.intersects(&kr)) {
+            black_key(c, *br, false);
+        }
+        c.rect(R::new(kr.x, r.y + 11.0, kr.w, 6.0), vgrad(r.y + 11.0, r.y + 17.0, Rgba::black(0.45), Rgba::black(0.0)));
+    }
 }

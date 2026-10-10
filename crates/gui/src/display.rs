@@ -36,10 +36,7 @@ pub fn draw(ui: &Ui, host: &dyn Host, c: &mut Canvas, r: R) {
 
     // context
     let cr = R::new(r.x + 262.0, r.y, r.w - 270.0, r.h);
-    let focus = ui.dragging_value().or_else(|| ui.hovered().and_then(|c| c.kind.addr())).or_else(|| {
-        ui.focus.and_then(|(addr, at)| (at.elapsed() < Duration::from_millis(1600)).then_some(addr))
-    });
-    match focus {
+    match focus(ui) {
         Some(addr) => {
             let spec = &PARAMS[addr];
             let v = host.get(addr);
@@ -50,6 +47,13 @@ pub fn draw(ui: &Ui, host: &dyn Host, c: &mut Canvas, r: R) {
         }
         None => voices(ui, c, cr),
     }
+}
+
+/// The parameter the display is showing, if any.
+pub fn focus(ui: &Ui) -> Option<usize> {
+    ui.dragging_value().or_else(|| ui.hovered().and_then(|c| c.kind.addr())).or_else(|| {
+        ui.focus.and_then(|(addr, at)| (at.elapsed() < Duration::from_millis(1600)).then_some(addr))
+    })
 }
 
 fn voices(ui: &Ui, c: &mut Canvas, r: R) {

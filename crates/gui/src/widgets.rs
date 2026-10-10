@@ -311,7 +311,8 @@ pub fn value_box(c: &mut Canvas, r: R, text: &str, hover: bool, arrows: bool) {
     c.rrect(r, 3.0, vgrad(r.y, r.bottom(), Rgba::hex(0x0A0A0B), Rgba::hex(0x121214)));
     c.rrect_stroke(r, 3.0, 0.75, if hover { Rgba::white(0.28) } else { Rgba::white(0.12) });
     let inner = if arrows { r.inset_xy(14.0, 0.0) } else { r.inset_xy(6.0, 0.0) };
-    c.text_in(text, inner, &Style::new(Face::Mono, 10.0, 0.0), t::AMBER, 0.5);
+    let ink = if text == "None" { t::INK_FAINT } else { t::AMBER };
+    c.text_in(text, inner, &Style::new(Face::Mono, 10.0, 0.0), ink, 0.5);
     if arrows {
         let col = if hover { t::INK } else { t::INK_DIM };
         chevron(c, r.x + 7.0, r.cy(), -1.0, col);
@@ -345,6 +346,9 @@ pub fn section(c: &mut Canvas, r: R, title: &str, accent: Rgba) {
     c.rrect(r, 6.0, vgrad(r.y, r.bottom(), Rgba::hex(0x252529), Rgba::hex(0x1D1D20)));
     c.rrect_stroke(r, 6.0, 1.0, Rgba::black(0.65));
     c.rrect_stroke(r.inset(1.0), 5.0, 1.0, Rgba::white(0.045));
+    if title.is_empty() {
+        return;
+    }
     // title strip
     let tx = r.x + 12.0;
     let ty = r.y + 17.0;
