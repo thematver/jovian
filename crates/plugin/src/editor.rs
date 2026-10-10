@@ -18,7 +18,91 @@ use std::num::NonZeroU32;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tiny_skia::Pixmap;
+
+const RESIZE_TIMEOUT: Duration = Duration::from_millis(750);
+
+#[derive(Clone, Copy)]
+struct ResizeRequest {
+    target: (u32, u32),
+    previous_zoom: u32,
+    started: Instant,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ResizeOutcome {
+    Pending,
+    Applied,
+    TimedOut,
+}
+
+impl ResizeRequest {
+    fn outcome(&self, logical: (f64, f64), visible: (f64, f64), now: Instant) -> ResizeOutcome {
+        let (w, h) = (self.target.0 as f64, self.target.1 as f64);
+        if (logical.0 - w).abs() <= 1.0 && (logical.1 - h).abs() <= 1.0 && visible.0 >= w - 1.0 && visible.1 >= h - 1.0 {
+            ResizeOutcome::Applied
+        } else if now.duration_since(self.started) >= RESIZE_TIMEOUT {
+            ResizeOutcome::TimedOut
+        } else {
+            ResizeOutcome::Pending
+        }
+    }
+}
+
+fn view_scale(logical_width: f64) -> f32 {
+    if logical_width.is_finite() && logical_width > 0.0 { (logical_width / layout::W as f64) as f32 } else { 1.0 }
+}
+
+fn zoom_for_size(logical: (f64, f64)) -> Option<u32> {
+    jovian_gui::ui::ZOOMS.into_iter().find(|zoom| {
+        let (w, h) = size_for_zoom(*zoom);
+        (logical.0 - w as f64).abs() <= 1.0 && (logical.1 - h as f64).abs() <= 1.0
+    })
+}
+
+struct NativeGeometry {
+    logical: (f64, f64),
+    physical: (u32, u32),
+    visible: (f64, f64),
+}
+
+fn native_geometry(window: &Window<'_>) -> Option<NativeGeometry> {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        use objc::runtime::Object;
+        use objc::{msg_send, sel, sel_impl};
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Point { x: f64, y: f64 }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Size { width: f64, height: f64 }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Rect { origin: Point, size: Size }
+
+        let RawWindowHandle::AppKit(h) = window.raw_window_handle() else { return None };
+        let view = h.ns_view as *mut Object;
+        if view.is_null() { return None; }
+        let bounds: Rect = msg_send![view, bounds];
+        let visible: Rect = msg_send![view, visibleRect];
+        let win: *mut Object = msg_send![view, window];
+        let backing: f64 = if win.is_null() { 1.0 } else { msg_send![win, backingScaleFactor] };
+        let (w, h) = (bounds.size.width, bounds.size.height);
+        if !w.is_finite() || !h.is_finite() || w <= 0.0 || h <= 0.0 || !backing.is_finite() || backing <= 0.0 { return None; }
+        Some(NativeGeometry {
+            logical: (w, h),
+            physical: ((w * backing).round() as u32, (h * backing).round() as u32),
+            visible: (visible.size.width.min(w).max(0.0), visible.size.height.min(h).max(0.0)),
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = window;
+        None
+    }
+}
 
 pub struct JovianEditor {
     pub params: Arc<JovianParams>,
@@ -27,7 +111,7 @@ pub struct JovianEditor {
 }
 
 pub fn size_for_zoom(zoom: u32) -> (u32, u32) {
-    let z = zoom as f32 / 100.0;
+    let z = jovian_gui::ui::valid_zoom(zoom) as f32 / 100.0;
     ((layout::W * z).round() as u32, (layout::H * z).round() as u32)
 }
 
@@ -147,12 +231,16 @@ impl Host for PluginHost {
         self.shared.meters()
     }
 
+    fn tempo_bpm(&self) -> f64 {
+        self.shared.tempo_bpm.load(Ordering::Relaxed) as f64
+    }
+
     fn compressor_reduction(&self, slot: usize) -> f32 {
         self.shared.comp_reduction.get(slot).map(|a| a.load(Ordering::Relaxed)).unwrap_or(0.0)
     }
 
     fn midi(&self, status: u8, d1: u8, d2: u8) {
-        let _ = self.shared.gui_midi.push(GuiMidi(status, d1, d2));
+        self.shared.send_gui_midi(GuiMidi(status, d1, d2));
     }
 
     fn resize(&self, w: u32, h: u32) -> bool {
@@ -169,6 +257,8 @@ struct EditorWindow {
     frame: Option<Pixmap>,
     physical: (u32, u32),
     logical: (f64, f64),
+    visible: (f64, f64),
+    resize_request: Option<ResizeRequest>,
     force: bool,
     cursor: jovian_gui::Cursor,
 }
@@ -188,13 +278,60 @@ impl EditorWindow {
             frame: None,
             physical: (w * 2, h * 2),
             logical: (w as f64, h as f64),
+            visible: (w as f64, h as f64),
+            resize_request: None,
             force: true,
             cursor: jovian_gui::Cursor::Default,
         }
     }
 
     fn zoom_factor(&self) -> f32 {
-        self.ui.zoom as f32 / 100.0
+        // Rendering follows the actual view, which may differ from a requested zoom
+        // while the host resizes asynchronously or declines to change its container.
+        view_scale(self.logical.0)
+    }
+
+    fn refresh_geometry(&mut self, window: &Window<'_>) {
+        // baseview's macOS view reports backing-scale changes but does not always
+        // emit Resized when setFrameSize changes only the logical dimensions.
+        if let Some(g) = native_geometry(window) {
+            self.visible = g.visible;
+            if self.logical != g.logical || self.physical != g.physical {
+                self.logical = g.logical;
+                self.physical = g.physical;
+                self.ui.invalidate_background();
+                self.force = true;
+                if self.resize_request.is_none() {
+                    if let Some(zoom) = zoom_for_size(self.logical) {
+                        self.ui.zoom = zoom;
+                        self.host.params.ui.write().zoom = zoom;
+                    }
+                }
+            }
+        }
+    }
+
+    fn restore_zoom(&mut self, window: &mut Window<'_>, zoom: u32, status: &str) {
+        self.resize_request = None;
+        self.ui.cancel_interaction(&self.host);
+        self.ui.zoom = zoom;
+        self.host.params.ui.write().zoom = zoom;
+        let (w, h) = size_for_zoom(zoom);
+        window.resize(baseview::Size::new(w as f64, h as f64));
+        self.refresh_geometry(window);
+        self.ui.invalidate_background();
+        self.ui.set_status(status);
+        self.force = true;
+    }
+
+    fn reconcile_resize(&mut self, window: &mut Window<'_>) {
+        if let Some(request) = self.resize_request {
+            match request.outcome(self.logical, self.visible, Instant::now()) {
+                ResizeOutcome::Applied => self.resize_request = None,
+                ResizeOutcome::TimedOut => self.restore_zoom(window, request.previous_zoom, "The host did not apply the requested zoom"),
+                ResizeOutcome::Pending => {}
+            }
+        }
     }
 
     /// The pointer position read from the window system (baseview's button events carry none,
@@ -271,6 +408,8 @@ impl EditorWindow {
 
     fn apply_pending(&mut self, window: &mut Window) {
         if let Some((w, h)) = self.host.pending_resize.take() {
+            let previous_zoom = self.resize_request.map(|r| r.previous_zoom).unwrap_or_else(|| self.host.params.ui.read().zoom);
+            self.resize_request = Some(ResizeRequest { target: (w, h), previous_zoom, started: Instant::now() });
             {
                 let mut u = self.host.params.ui.write();
                 u.zoom = self.ui.zoom;
@@ -278,10 +417,7 @@ impl EditorWindow {
             if self.host.ctx.request_resize() {
                 window.resize(baseview::Size::new(w as f64, h as f64));
             } else {
-                // the host refused: go back to the size the window has
-                let mut u = self.host.params.ui.write();
-                u.zoom = ((self.logical.0 / layout::W as f64) * 100.0).round() as u32;
-                self.ui.zoom = u.zoom;
+                self.restore_zoom(window, previous_zoom, "The host does not allow resizing");
             }
             self.ui.invalidate_background();
             self.force = true;
@@ -303,7 +439,9 @@ fn mods(m: &Modifiers) -> Mods {
 }
 
 impl WindowHandler for EditorWindow {
-    fn on_frame(&mut self, _window: &mut Window) {
+    fn on_frame(&mut self, window: &mut Window) {
+        self.refresh_geometry(window);
+        self.reconcile_resize(window);
         let dirty = self.ui.tick(&self.host);
         if !dirty && !self.force {
             return;
@@ -344,6 +482,7 @@ impl WindowHandler for EditorWindow {
     }
 
     fn on_event(&mut self, window: &mut Window, event: BvEvent) -> EventStatus {
+        self.refresh_geometry(window);
         let status = match event {
             BvEvent::Mouse(m) => {
                 let ev = match m {
@@ -421,14 +560,27 @@ impl WindowHandler for EditorWindow {
                 self.physical = (p.width, p.height);
                 let l = info.logical_size();
                 self.logical = (l.width, l.height);
+                self.visible = self.logical;
                 self.force = true;
                 EventStatus::Captured
+            }
+            BvEvent::Window(WindowEvent::Unfocused | WindowEvent::WillClose) => {
+                self.ui.cancel_interaction(&self.host);
+                self.force = true;
+                EventStatus::Ignored
             }
             BvEvent::Window(_) => EventStatus::Ignored,
         };
         self.apply_pending(window);
         self.update_cursor();
         status
+    }
+}
+
+impl Drop for EditorWindow {
+    fn drop(&mut self) {
+        // Some hosts destroy the child view without delivering WillClose.
+        self.ui.cancel_interaction(&self.host);
     }
 }
 
@@ -495,4 +647,40 @@ fn sb_handle(window: &Window<'_>) -> SbHandle {
         _ => raw_window_handle_06::RawDisplayHandle::Windows(raw_window_handle_06::WindowsDisplayHandle::new()),
     };
     SbHandle { display, window: window_handle }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pointer_scale_follows_actual_view_during_pending_zoom() {
+        // A 115% request does not change where controls are drawn in a view still at 100%.
+        let old = size_for_zoom(100);
+        assert_eq!(view_scale(old.0 as f64), 1.0);
+        let requested = size_for_zoom(115);
+        assert!((view_scale(requested.0 as f64) - 1.15).abs() < 0.001);
+        assert_eq!(zoom_for_size((old.0 as f64, old.1 as f64)), Some(100));
+    }
+
+    #[test]
+    fn resize_waits_for_async_host_before_reverting() {
+        let started = Instant::now();
+        let request = ResizeRequest { target: size_for_zoom(115), previous_zoom: 100, started };
+        let old = (layout::W as f64, layout::H as f64);
+        assert_eq!(request.outcome(old, old, started + Duration::from_millis(100)), ResizeOutcome::Pending);
+        let target = (request.target.0 as f64, request.target.1 as f64);
+        assert_eq!(request.outcome(target, target, started + Duration::from_millis(300)), ResizeOutcome::Applied);
+        assert_eq!(request.outcome(old, old, started + RESIZE_TIMEOUT), ResizeOutcome::TimedOut);
+    }
+
+    #[test]
+    fn larger_child_clipped_by_fixed_host_does_not_confirm_zoom() {
+        let started = Instant::now();
+        let request = ResizeRequest { target: size_for_zoom(115), previous_zoom: 100, started };
+        let child = (request.target.0 as f64, request.target.1 as f64);
+        let visible = (layout::W as f64, layout::H as f64);
+        assert_eq!(request.outcome(child, visible, started + Duration::from_millis(100)), ResizeOutcome::Pending);
+        assert_eq!(request.outcome(child, visible, started + RESIZE_TIMEOUT), ResizeOutcome::TimedOut);
+    }
 }

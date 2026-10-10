@@ -48,24 +48,20 @@ pub fn fader_cap_y(r: R, v: f32) -> f32 {
 /// Slot and scale of a fader (background layer).
 pub fn fader_static(c: &mut Canvas, r: R, origin: f32) {
     let g = fader_geom(r);
-    // scale ticks on both sides, longer at 0, 5 and 10
     for i in 0..=10 {
         let y = g.bottom - (g.bottom - g.top) * i as f32 / 10.0;
         let major = i % 5 == 0;
-        let len = if major { 5.0 } else { 3.0 };
-        let col = if major { Rgba::white(0.34) } else { Rgba::white(0.17) };
-        c.hline(g.cx - 8.0 - len, g.cx - 8.0, y, 1.0, col);
-        c.hline(g.cx + 8.0, g.cx + 8.0 + len, y, 1.0, col);
+        let len = if major { 5.0 } else { 2.5 };
+        let col = if major { t::LINE_STRONG } else { t::LINE };
+        c.hline(g.cx - 9.0 - len, g.cx - 9.0, y, 1.0, col);
+        c.hline(g.cx + 9.0, g.cx + 9.0 + len, y, 1.0, col);
     }
     if origin > 0.0 {
         let y = g.bottom - (g.bottom - g.top) * origin;
-        c.hline(g.cx - 16.0, g.cx - 8.0, y, 1.0, Rgba::white(0.55));
-        c.hline(g.cx + 8.0, g.cx + 16.0, y, 1.0, Rgba::white(0.55));
+        c.hline(g.cx - 15.0, g.cx - 8.0, y, 1.0, t::INK_DIM);
+        c.hline(g.cx + 8.0, g.cx + 15.0, y, 1.0, t::INK_DIM);
     }
-    // slot
-    let slot = R::new(g.cx - 2.5, g.top - 4.0, 5.0, g.bottom - g.top + 8.0);
-    c.rrect(slot.inset(-1.0), 3.5, Rgba::white(0.06));
-    c.rrect(slot, 2.5, vgrad(slot.y, slot.bottom(), Rgba::hex(0x050506), Rgba::hex(0x0C0C0E)));
+    c.rrect(R::new(g.cx - 2.0, g.top - 2.0, 4.0, g.bottom - g.top + 4.0), 2.0, t::WELL);
 }
 
 /// Moving parts of a fader: value trace, cap and the label / value line.
@@ -73,35 +69,23 @@ pub fn fader_static(c: &mut Canvas, r: R, origin: f32) {
 pub fn fader(c: &mut Canvas, r: R, v: f32, color: Rgba, origin: f32, label: &str, value: Option<&str>, hover: bool, active: bool) {
     let g = fader_geom(r);
     let y = fader_cap_y(r, v);
-    // value trace inside the slot
-    let from = if origin > 0.0 { g.bottom - (g.bottom - g.top) * origin } else { g.bottom + 2.0 };
+    let from = if origin > 0.0 { g.bottom - (g.bottom - g.top) * origin } else { g.bottom };
     let (a, b) = if y < from { (y, from) } else { (from, y) };
     if b - a > 0.5 {
-        c.rrect(R::new(g.cx - 1.25, a, 2.5, b - a), 1.25, color.with_alpha(if hover || active { 1.0 } else { 0.85 }));
-        c.rrect(R::new(g.cx - 3.5, a, 7.0, b - a), 3.5, color.with_alpha(0.14));
+        c.rrect(R::new(g.cx - 1.5, a, 3.0, b - a), 1.5, color);
     }
-    // cap
     let cap = R::new(g.cx - FADER_CAP_W * 0.5, y - FADER_CAP_H * 0.5, FADER_CAP_W, FADER_CAP_H);
-    c.shadow(cap, 2.5, 3.0, 2.0, Rgba::black(0.75));
-    let (top, bot) = if active {
-        (Rgba::hex(0xFFFFFF), Rgba::hex(0xD6D5CF))
-    } else if hover {
-        (Rgba::hex(0xFAFAF7), Rgba::hex(0xCDCCC6))
-    } else {
-        (Rgba::hex(0xEDECE8), Rgba::hex(0xB9B8B2))
-    };
-    c.rrect(cap, 2.5, vgrad(cap.y, cap.bottom(), top, bot));
-    c.rrect_stroke(cap, 2.5, 0.75, Rgba::black(0.55));
-    c.hline(cap.x + 2.0, cap.right() - 2.0, cap.y + 1.0, 1.0, Rgba::white(0.8));
-    c.rect(R::new(cap.x + 1.5, y - 0.9, cap.w - 3.0, 1.8), Rgba::hex(0x1A1A1A));
-    // label / value
+    if hover || active { c.rrect_stroke(cap.inset(-3.0), 3.0, 1.0, color.with_alpha(0.6)); }
+    c.rrect(cap.offset(0.0, 1.0), 2.0, t::INK.with_alpha(0.16));
+    c.rrect(cap, 2.0, if active { color } else { t::INK });
+    c.hline(cap.x + 4.0, cap.right() - 4.0, y, 1.5, t::PANEL_TOP);
     let lr = R::new(r.x - 6.0, r.bottom() - FADER_LABEL_H + 6.0, r.w + 12.0, 12.0);
-    match value {
-        Some(vs) if hover || active => {
-            c.text_in(vs, lr, &t::VALUE, t::AMBER, 0.5);
-        }
-        _ => {
-            c.text_in(label, lr, &t::LABEL, if hover { t::INK } else { t::INK.with_alpha(0.86) }, 0.5);
+    c.text_in(label, lr, &t::LABEL, t::INK, 0.5);
+    if hover || active {
+        if let Some(vs) = value {
+            let vr = R::new(r.cx() - 34.0, cap.y - 18.0, 68.0, 15.0);
+            c.rrect(vr, 2.0, t::DISPLAY_BG);
+            c.text_in(vs, vr, &t::VALUE, t::AMBER, 0.5);
         }
     }
 }
@@ -128,27 +112,15 @@ pub fn switch_items(r: R, n: usize, vertical: bool, gap: f32) -> Vec<R> {
 
 /// One lit button of a switch / toggle.
 pub fn button(c: &mut Canvas, r: R, item: &Item, color: Rgba, on: bool, hover: bool, small: bool) {
-    let rad = 3.0;
-    c.shadow(r, rad, 2.0, 1.0, Rgba::black(0.55));
-    if on {
-        let top = color.lighten(0.12);
-        let bot = color.darken(0.08);
-        c.rrect(r, rad, vgrad(r.y, r.bottom(), top, bot));
-        c.rrect(r.inset(-0.5), rad + 0.5, Fill::Solid(color.with_alpha(0.0)));
-        c.hline(r.x + 2.0, r.right() - 2.0, r.y + 0.75, 1.0, Rgba::white(0.45));
-        c.rrect_stroke(r, rad, 0.75, Rgba::black(0.35));
-    } else {
-        let base = color.mix(t::PANEL_BOTTOM, 0.8);
-        let top = base.lighten(if hover { 0.1 } else { 0.05 });
-        c.rrect(r, rad, vgrad(r.y, r.bottom(), top, base.darken(0.15)));
-        c.hline(r.x + 2.0, r.right() - 2.0, r.y + 0.75, 1.0, Rgba::white(0.08));
-        c.rrect_stroke(r, rad, 0.75, Rgba::black(0.6));
-    }
-    let ink = if on { t::INK_DARK } else { color.lighten(0.35).with_alpha(if hover { 0.95 } else { 0.72 }) };
+    let neutral = color == t::WHITE_KEY;
+    let selected = if neutral { t::INK } else { color };
+    c.rrect(r, 2.0, if on { selected } else if hover { t::WELL } else { t::PANEL_BOTTOM });
+    c.rrect_stroke(r, 2.0, 1.0, if on { selected } else if hover { t::LINE_STRONG } else { t::LINE });
+    let ink = if on { t::PANEL_TOP } else { t::INK_DIM };
     match item {
         Item::Text(s) => {
-            let st = if small { Style::new(Face::CondBold, 8.5, 0.5) } else { t::BUTTON };
-            c.text_in(s, r.offset(0.0, 0.25), &st, ink, 0.5);
+            let st = if small { Style::new(Face::CondSemi, 8.5, 0.0) } else { t::BUTTON };
+            c.text_in(s, r, &st, ink, 0.5);
         }
         Item::Icon(i) => icon(c, *i, R::new(r.cx() - 9.0, r.cy() - 4.5, 18.0, 9.0), ink, 1.4),
     }
@@ -269,13 +241,10 @@ fn arc(pb: &mut PathBuilder, cx: f32, cy: f32, r: f32, a0: f32, a1: f32, start: 
 pub fn knob_static(c: &mut Canvas, cx: f32, cy: f32, rad: f32) {
     let mut pb = PathBuilder::new();
     arc(&mut pb, cx, cy, rad + 4.0, KNOB_START, KNOB_START + KNOB_SWEEP, true);
-    if let Some(p) = pb.finish() {
-        c.stroke_path(&p, 2.5, Rgba::black(0.55));
-    }
-    // ticks at both ends and centre
+    if let Some(p) = pb.finish() { c.stroke_path(&p, 2.0, t::WELL); }
     for k in [0.0f32, 0.5, 1.0] {
         let a = KNOB_START + KNOB_SWEEP * k;
-        c.line(cx + (rad + 7.0) * a.cos(), cy + (rad + 7.0) * a.sin(), cx + (rad + 9.5) * a.cos(), cy + (rad + 9.5) * a.sin(), 1.0, Rgba::white(0.3));
+        c.line(cx + (rad + 7.0) * a.cos(), cy + (rad + 7.0) * a.sin(), cx + (rad + 9.0) * a.cos(), cy + (rad + 9.0) * a.sin(), 1.0, t::LINE_STRONG);
     }
 }
 
@@ -283,40 +252,34 @@ pub fn knob_static(c: &mut Canvas, cx: f32, cy: f32, rad: f32) {
 #[allow(clippy::too_many_arguments)]
 pub fn knob(c: &mut Canvas, cx: f32, cy: f32, rad: f32, v: f32, color: Rgba, bipolar: bool, hover: bool, active: bool) {
     let v = v.clamp(0.0, 1.0);
+    let color = if color == t::WHITE_KEY { t::INK_DIM } else { color };
     let a0 = if bipolar { KNOB_START + KNOB_SWEEP * 0.5 } else { KNOB_START };
     let a1 = KNOB_START + KNOB_SWEEP * v;
     if (a1 - a0).abs() > 0.01 {
         let mut pb = PathBuilder::new();
         let (s, e) = if a1 > a0 { (a0, a1) } else { (a1, a0) };
         arc(&mut pb, cx, cy, rad + 4.0, s, e, true);
-        if let Some(p) = pb.finish() {
-            c.stroke_path(&p, 5.0, color.with_alpha(0.18));
-            c.stroke_path(&p, 2.2, color);
-        }
+        if let Some(p) = pb.finish() { c.stroke_path(&p, 2.5, color); }
     }
-    // body
-    c.shadow(R::new(cx - rad, cy - rad, rad * 2.0, rad * 2.0), rad, 3.0, 2.0, Rgba::black(0.7));
-    let lit = if active { 0.1 } else if hover { 0.05 } else { 0.0 };
-    c.circle(cx, cy, rad, Fill::Linear(cx, cy - rad, cx, cy + rad, vec![(0.0, Rgba::hex(0x48484E).lighten(lit)), (1.0, Rgba::hex(0x1E1E21).lighten(lit))]));
-    c.circle(cx, cy, rad - 2.5, Fill::Linear(cx, cy - rad, cx, cy + rad, vec![(0.0, Rgba::hex(0x2C2C30).lighten(lit)), (1.0, Rgba::hex(0x37373C).lighten(lit))]));
-    c.circle_stroke(cx, cy, rad, 0.75, Rgba::black(0.8));
-    // pointer
-    let a = a1;
-    let (ca, sa) = (a.cos(), a.sin());
-    c.line(cx + ca * rad * 0.25, cy + sa * rad * 0.25, cx + ca * (rad - 3.0), cy + sa * (rad - 3.0), 2.0, Rgba::hex(0xF2F0EA));
+    c.circle(cx, cy + 1.0, rad, t::INK.with_alpha(0.12));
+    c.circle(cx, cy, rad, if active { t::WELL } else { t::PANEL_TOP });
+    c.circle_stroke(cx, cy, rad, 1.0, if hover || active { color } else { t::LINE_STRONG });
+    let (ca, sa) = (a1.cos(), a1.sin());
+    c.line(cx + ca * rad * 0.40, cy + sa * rad * 0.40, cx + ca * (rad - 4.0), cy + sa * (rad - 4.0), 2.0, t::INK);
+    c.circle(cx, cy, 1.3, t::INK_FAINT);
 }
 
 /// A recessed value box (steppers, menus).
 pub fn value_box(c: &mut Canvas, r: R, text: &str, hover: bool, arrows: bool) {
-    c.rrect(r, 3.0, vgrad(r.y, r.bottom(), Rgba::hex(0x0A0A0B), Rgba::hex(0x121214)));
-    c.rrect_stroke(r, 3.0, 0.75, if hover { Rgba::white(0.28) } else { Rgba::white(0.12) });
+    c.rrect(r, 2.0, t::DISPLAY_BG);
+    c.rrect_stroke(r, 2.0, 1.0, if hover { t::BLUE } else { t::DISPLAY_BG });
     let inner = if arrows { r.inset_xy(14.0, 0.0) } else { r.inset_xy(6.0, 0.0) };
-    let ink = if text == "None" { t::INK_FAINT } else { t::AMBER };
-    c.text_in(text, inner, &Style::new(Face::Mono, 10.0, 0.0), ink, 0.5);
+    c.set_clip(inner);
+    c.text_in(text, inner, &Style::new(Face::Mono, 10.0, 0.0), if text == "None" { t::DISPLAY_DIM } else { t::DISPLAY_INK }, 0.5);
+    c.clear_clip();
     if arrows {
-        let col = if hover { t::INK } else { t::INK_DIM };
-        chevron(c, r.x + 7.0, r.cy(), -1.0, col);
-        chevron(c, r.right() - 7.0, r.cy(), 1.0, col);
+        chevron(c, r.x + 7.0, r.cy(), -1.0, t::DISPLAY_DIM);
+        chevron(c, r.right() - 7.0, r.cy(), 1.0, t::DISPLAY_DIM);
     }
 }
 
@@ -342,20 +305,15 @@ pub fn caret_down(c: &mut Canvas, x: f32, y: f32, col: Rgba) {
 
 /// Section frame with title (background layer).
 pub fn section(c: &mut Canvas, r: R, title: &str, accent: Rgba) {
-    c.shadow(r, 6.0, 6.0, 3.0, Rgba::black(0.45));
-    c.rrect(r, 6.0, vgrad(r.y, r.bottom(), Rgba::hex(0x252529), Rgba::hex(0x1D1D20)));
-    c.rrect_stroke(r, 6.0, 1.0, Rgba::black(0.65));
-    c.rrect_stroke(r.inset(1.0), 5.0, 1.0, Rgba::white(0.045));
-    if title.is_empty() {
-        return;
-    }
-    // title strip
+    c.rrect(r, 3.0, t::PANEL_TOP);
+    c.rrect_stroke(r, 3.0, 1.0, t::LINE);
+    if title.is_empty() { return; }
+    let accent = if accent == t::WHITE_KEY { t::INK_DIM } else { accent };
     let tx = r.x + 12.0;
-    let ty = r.y + 17.0;
-    c.rrect(R::new(tx, ty - 8.5, 3.0, 9.5), 1.0, accent);
-    c.text(title, tx + 8.0, ty, &t::TITLE, t::INK, 0.0);
-    let w = c.fonts.measure(title, &t::TITLE);
-    c.hline(tx + 8.0 + w + 8.0, r.right() - 12.0, ty - 4.0, 1.0, Rgba::white(0.1));
+    let ty = r.y + 19.0;
+    c.circle(tx + 2.0, ty - 4.0, 2.5, accent);
+    c.text(title, tx + 11.0, ty, &t::TITLE, t::INK, 0.0);
+    c.hline(r.x + 12.0, r.right() - 12.0, r.y + 29.0, 1.0, t::LINE);
 }
 
 /// Small caption (background layer), centred above a control.
@@ -367,57 +325,45 @@ pub fn caption(c: &mut Canvas, s: &str, cx: f32, y: f32) {
 pub fn bracket(c: &mut Canvas, x0: f32, x1: f32, y: f32, s: &str) {
     let w = c.fonts.measure(s, &t::SMALL) + 10.0;
     let cx = (x0 + x1) * 0.5;
-    c.hline(x0, cx - w * 0.5, y, 1.0, Rgba::white(0.18));
-    c.hline(cx + w * 0.5, x1, y, 1.0, Rgba::white(0.18));
-    c.vline(x0, y, y + 4.0, 1.0, Rgba::white(0.18));
-    c.vline(x1 - 1.0, y, y + 4.0, 1.0, Rgba::white(0.18));
+    c.hline(x0, cx - w * 0.5, y, 1.0, t::LINE);
+    c.hline(cx + w * 0.5, x1, y, 1.0, t::LINE);
+    c.vline(x0, y, y + 4.0, 1.0, t::LINE);
+    c.vline(x1 - 1.0, y, y + 4.0, 1.0, t::LINE);
     c.text(s, cx, y + 3.5, &t::SMALL, t::INK_DIM, 0.5);
 }
 
 /// Tab of the page bar.
 pub fn tab(c: &mut Canvas, r: R, label: &str, on: bool, hover: bool) {
-    if on {
-        c.rrect(r, 4.0, vgrad(r.y, r.bottom(), Rgba::hex(0x3A3A40), Rgba::hex(0x2C2C31)));
-        c.hline(r.x + 3.0, r.right() - 3.0, r.y + 0.75, 1.0, Rgba::white(0.12));
-        c.rrect(R::new(r.cx() - 9.0, r.bottom() - 3.0, 18.0, 2.0), 1.0, t::ORANGE);
-    } else if hover {
-        c.rrect(r, 4.0, Rgba::white(0.05));
-    }
-    let st = Style::new(Face::CondBold, 11.0, 1.4);
-    c.text_in(label, r.offset(0.0, -0.5), &st, if on { t::INK } else if hover { t::INK.with_alpha(0.8) } else { t::INK_DIM }, 0.5);
+    if on { c.rrect(r, 3.0, t::INK); }
+    else if hover { c.rrect(r, 3.0, t::WELL); }
+    let num = match label { "SYNTH" => "01", "MOD" => "02", "EFFECTS" => "03", _ => "04" };
+    let ink = if on { t::PANEL_TOP } else { t::INK_DIM };
+    c.text(num, r.x + 9.0, r.y + 12.0, &Style::new(Face::Mono, 8.0, 0.0), if on { t::AMBER } else { t::INK_FAINT }, 0.0);
+    c.text(label, r.x + 9.0, r.bottom() - 10.0, &Style::new(Face::Semi, 10.0, 0.3), ink, 0.0);
+    if on { c.circle(r.right() - 10.0, r.y + 9.0, 2.0, t::ORANGE); }
 }
 
 /// Generic flat text button.
 pub fn text_button(c: &mut Canvas, r: R, label: &str, hover: bool, primary: bool) {
-    let (a, b) = if primary { (t::ORANGE.lighten(0.08), t::ORANGE.darken(0.08)) } else { (Rgba::hex(0x34343A), Rgba::hex(0x2A2A2F)) };
-    c.shadow(r, 4.0, 2.0, 1.0, Rgba::black(0.5));
-    c.rrect(r, 4.0, vgrad(r.y, r.bottom(), if hover { a.lighten(0.08) } else { a }, b));
-    c.rrect_stroke(r, 4.0, 0.75, Rgba::black(0.5));
-    c.hline(r.x + 3.0, r.right() - 3.0, r.y + 0.75, 1.0, Rgba::white(if primary { 0.35 } else { 0.1 }));
-    let st = Style::new(Face::Semi, 11.0, 0.3);
-    c.text_in(label, r, &st, if primary { t::INK_DARK } else { t::INK }, 0.5);
+    let fill = if primary { t::ORANGE } else if hover { t::WELL } else { t::PANEL_TOP };
+    c.rrect(r, 2.0, fill);
+    c.rrect_stroke(r, 2.0, 1.0, if primary { t::ORANGE } else { t::LINE_STRONG });
+    c.text_in(label, r, &Style::new(Face::Semi, 11.0, 0.0), if primary { t::PANEL_TOP } else { t::INK }, 0.5);
 }
 
 /// Horizontal bipolar/unipolar slider (matrix amounts, browser).
 #[allow(clippy::too_many_arguments)]
 pub fn hslider(c: &mut Canvas, r: R, v: f32, color: Rgba, bipolar: bool, hover: bool, active: bool) {
-    let track = R::new(r.x, r.cy() - 2.0, r.w, 4.0);
-    c.rrect(track, 2.0, Rgba::hex(0x0B0B0C));
+    let color = if color == t::WHITE_KEY { t::INK_DIM } else { color };
+    let track = R::new(r.x, r.cy() - 1.5, r.w, 3.0);
+    c.rrect(track, 1.5, t::WELL);
     let x = r.x + r.w * v.clamp(0.0, 1.0);
     let from = if bipolar { r.cx() } else { r.x };
     let (a, b) = if x < from { (x, from) } else { (from, x) };
-    if b - a > 0.5 {
-        c.rrect(R::new(a, track.y + 0.5, b - a, 3.0), 1.5, color);
-    }
-    if bipolar {
-        c.vline(r.cx(), r.cy() - 4.0, r.cy() + 4.0, 1.0, Rgba::white(0.3));
-    }
-    let k = R::new(x - 5.0, r.cy() - 5.0, 10.0, 10.0);
-    c.shadow(k, 5.0, 2.0, 1.0, Rgba::black(0.6));
-    c.circle(x, r.cy(), 5.0, vgrad(k.y, k.bottom(), Rgba::hex(0xF4F3EF), Rgba::hex(0xBDBCB6)));
-    if hover || active {
-        c.circle_stroke(x, r.cy(), 6.5, 1.0, color.with_alpha(0.7));
-    }
+    if b - a > 0.5 { c.rrect(R::new(a, track.y, b - a, 3.0), 1.5, color); }
+    if bipolar { c.vline(r.cx(), r.cy() - 4.0, r.cy() + 4.0, 1.0, t::LINE_STRONG); }
+    c.circle(x, r.cy(), 4.5, t::INK);
+    if hover || active { c.circle_stroke(x, r.cy(), 7.0, 1.0, color); }
 }
 
 /// Horizontal gradient strip of the Jupiter colours (logo accent).

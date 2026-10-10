@@ -1,22 +1,20 @@
-//! Where every control sits. Sections of a row are laid out from column specs and stretched so
-//! that all rows share the same edges.
+//! Instrument workspace: source → tone → voice, with a compact audition dock.
 
 use crate::canvas::{Rgba, R};
 use crate::theme as t;
 use crate::widgets::{Icon, Item};
 use jovian_core::params::addr as a;
 
-pub const W: f32 = 1240.0;
-pub const H: f32 = 720.0;
-pub const HEADER_H: f32 = 52.0;
-pub const MARGIN: f32 = 12.0;
-pub const LEFT_W: f32 = 256.0;
-pub const GAP: f32 = 8.0;
-pub const BODY_TOP: f32 = HEADER_H + 8.0;
-pub const ROW_H: f32 = 248.0;
-pub const BOTTOM_TOP: f32 = BODY_TOP + 2.0 * ROW_H + GAP + GAP;
+pub const W: f32 = 1320.0;
+pub const H: f32 = 780.0;
+pub const HEADER_H: f32 = 72.0;
+pub const MARGIN: f32 = 16.0;
+pub const LEFT_W: f32 = 156.0;
+pub const GAP: f32 = 10.0;
+pub const BODY_TOP: f32 = 84.0;
+pub const BOTTOM_TOP: f32 = 662.0;
 pub const BOTTOM_H: f32 = H - BOTTOM_TOP - MARGIN;
-pub const RIGHT_X: f32 = MARGIN + LEFT_W + GAP;
+pub const RIGHT_X: f32 = 184.0;
 pub const RIGHT_W: f32 = W - MARGIN - RIGHT_X;
 /// The area pages other than SYNTH use.
 pub const BODY: R = R::new(MARGIN, BODY_TOP, W - 2.0 * MARGIN, BOTTOM_TOP - GAP - BODY_TOP);
@@ -90,6 +88,8 @@ pub struct Control {
     pub kind: Kind,
     /// Only shown while the discrete parameter `.0` is at item `.1` (effect parameters).
     pub when: Option<(usize, usize)>,
+    /// UI-only source/effect inspector selection. Never stored in an audio parameter.
+    pub view: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -114,12 +114,12 @@ impl Layout {
             Kind::Fader { origin, .. } => self.decos.push((page, Deco::FaderSlot { r, origin: *origin })),
             _ => {}
         }
-        self.controls.push(Control { r, page, kind, when: None });
+        self.controls.push(Control { r, page, kind, when: None, view: None });
     }
 
     /// Adds a control that is only visible while `addr` is at item `index`.
     pub fn push_when(&mut self, page: Option<Page>, r: R, kind: Kind, addr: usize, index: usize) {
-        self.controls.push(Control { r, page, kind, when: Some((addr, index)) });
+        self.controls.push(Control { r, page, kind, when: Some((addr, index)), view: None });
     }
 
     pub fn deco(&mut self, page: Option<Page>, d: Deco) {
@@ -127,416 +127,139 @@ impl Layout {
     }
 }
 
-// MARK: - section builder
 
-pub const FADER_W: f32 = 36.0;
-pub const SWITCH_W: f32 = 44.0;
-const PAD: f32 = 12.0;
-const COL_GAP: f32 = 6.0;
-const TITLE_H: f32 = 34.0;
-const BOTTOM_PAD: f32 = 8.0;
-const ITEM_H: f32 = 20.0;
-const ITEM_GAP: f32 = 4.0;
-const CAPTION_H: f32 = 14.0;
+fn texts(s: &[&'static str]) -> Vec<Item> { s.iter().map(|x| Item::Text(x)).collect() }
+fn icons(s: &[Icon]) -> Vec<Item> { s.iter().map(|x| Item::Icon(*x)).collect() }
 
-pub enum Stacked {
-    Switch { addr: usize, items: Vec<Item>, order: Vec<usize>, caption: Option<&'static str> },
-    Toggle { addr: usize, label: &'static str, caption: Option<&'static str> },
-    Space(f32),
+fn knob(l: &mut Layout, page: Option<Page>, cx: f32, y: f32, width: f32, radius: f32, addr: usize, label: &'static str, color: Rgba, bipolar: bool) {
+    l.push(page, R::new(cx - width * 0.5, y, width, 2.0 * radius + 42.0), Kind::Knob { addr, label, color, bipolar, radius });
+}
+fn label(l: &mut Layout, page: Option<Page>, text: &'static str, x: f32, y: f32, align: f32) {
+    l.deco(page, Deco::Label { text, x, y, align });
+}
+fn switch(l: &mut Layout, page: Option<Page>, r: R, addr: usize, items: Vec<Item>, color: Rgba) {
+    let order = (0..items.len()).collect();
+    l.push(page, r, Kind::Switch { addr, items, order, color, vertical: false });
 }
 
-pub enum Col {
-    Fader { addr: usize, label: &'static str, origin: f32 },
-    Stack { w: f32, items: Vec<Stacked> },
-    /// Extra space between columns.
-    Gap(f32),
-}
-
-impl Col {
-    fn width(&self) -> f32 {
-        match self {
-            Col::Fader { .. } => FADER_W,
-            Col::Stack { w, .. } => *w,
-            Col::Gap(g) => *g,
-        }
-    }
-}
-
-pub struct SectionSpec {
-    pub title: &'static str,
-    pub accent: Rgba,
-    pub cols: Vec<Col>,
-}
-
-impl SectionSpec {
-    fn natural(&self) -> f32 {
-        let n = self.cols.iter().filter(|c| !matches!(c, Col::Gap(_))).count();
-        2.0 * PAD + self.cols.iter().map(|c| c.width()).sum::<f32>() + COL_GAP * (n.max(1) - 1) as f32
-    }
-}
-
-/// Lays out a row of sections from `x` over `width`, stretching inner gaps to fill it.
-pub fn row(l: &mut Layout, page: Page, x: f32, y: f32, width: f32, h: f32, sections: Vec<SectionSpec>) {
-    let natural: f32 = sections.iter().map(|s| s.natural()).sum::<f32>() + GAP * (sections.len() - 1) as f32;
-    let extra = (width - natural).max(0.0);
-    // extra space goes into the gaps between columns (and a little into the padding)
-    let slots: usize = sections.iter().map(|s| s.cols.iter().filter(|c| !matches!(c, Col::Gap(_))).count() + 1).sum();
-    let per_slot = extra / slots as f32;
-    let mut sx = x;
-    for s in sections {
-        let ncols = s.cols.iter().filter(|c| !matches!(c, Col::Gap(_))).count();
-        let sw = s.natural() + per_slot * (ncols + 1) as f32;
-        let sr = R::new(sx, y, sw, h);
-        l.deco(Some(page), Deco::Section { r: sr, title: s.title, accent: s.accent });
-        let mut cx = sx + PAD + per_slot * 0.5;
-        let top = y + TITLE_H;
-        let bottom = y + h - BOTTOM_PAD;
-        let mut first = true;
-        for c in s.cols {
-            if let Col::Gap(g) = c {
-                cx += g;
-                continue;
-            }
-            if !first {
-                cx += COL_GAP + per_slot;
-            }
-            first = false;
-            let w = c.width();
-            match c {
-                Col::Fader { addr, label, origin } => {
-                    l.push(Some(page), R::new(cx, top, w, bottom - top), Kind::Fader { addr, label, color: s.accent, origin });
-                }
-                Col::Stack { items, .. } => {
-                    // stacks are centred in the column, above the fader label line
-                    let content: f32 = items
-                        .iter()
-                        .map(|it| match it {
-                            Stacked::Space(h) => *h,
-                            Stacked::Switch { items, caption, .. } => {
-                                let n = items.len() as f32;
-                                caption.map_or(0.0, |_| CAPTION_H) + n * ITEM_H + (n - 1.0) * ITEM_GAP + 10.0
-                            }
-                            Stacked::Toggle { caption, .. } => caption.map_or(0.0, |_| CAPTION_H) + ITEM_H + ITEM_GAP,
-                        })
-                        .sum();
-                    let avail = bottom - top - crate::widgets::FADER_LABEL_H;
-                    let mut yy = top + ((avail - content) * 0.42).max(2.0);
-                    for it in items {
-                        match it {
-                            Stacked::Space(h) => yy += h,
-                            Stacked::Switch { addr, items, order, caption } => {
-                                if let Some(cap) = caption {
-                                    l.deco(Some(page), Deco::Caption { text: cap, cx: cx + w * 0.5, y: yy + 8.0 });
-                                    yy += CAPTION_H;
-                                }
-                                let n = items.len() as f32;
-                                let hh = n * ITEM_H + (n - 1.0) * ITEM_GAP;
-                                l.push(Some(page), R::new(cx, yy, w, hh), Kind::Switch { addr, items, order, color: s.accent, vertical: true });
-                                yy += hh + 10.0;
-                            }
-                            Stacked::Toggle { addr, label, caption } => {
-                                if let Some(cap) = caption {
-                                    l.deco(Some(page), Deco::Caption { text: cap, cx: cx + w * 0.5, y: yy + 8.0 });
-                                    yy += CAPTION_H;
-                                }
-                                l.push(Some(page), R::new(cx, yy, w, ITEM_H), Kind::Toggle { addr, label, color: t::WHITE_KEY });
-                                yy += ITEM_H + ITEM_GAP;
-                            }
-                        }
-                    }
-                }
-                Col::Gap(_) => {}
-            }
-            cx += w;
-        }
-        sx += sw + GAP;
-    }
-}
-
-fn texts(s: &[&'static str]) -> Vec<Item> {
-    s.iter().map(|x| Item::Text(x)).collect()
-}
-
-fn icons(s: &[Icon]) -> Vec<Item> {
-    s.iter().map(|x| Item::Icon(*x)).collect()
-}
-
-fn fader(addr: usize, label: &'static str) -> Col {
-    Col::Fader { addr, label, origin: 0.0 }
-}
-
-fn bipolar(addr: usize, label: &'static str) -> Col {
-    Col::Fader { addr, label, origin: 0.5 }
-}
-
-fn stack(w: f32, items: Vec<Stacked>) -> Col {
-    Col::Stack { w, items }
-}
-
-fn sw(addr: usize, items: Vec<Item>, order: &[usize], caption: Option<&'static str>) -> Stacked {
-    Stacked::Switch { addr, items, order: order.to_vec(), caption }
-}
-
-fn toggle(addr: usize, label: &'static str, caption: Option<&'static str>) -> Stacked {
-    Stacked::Toggle { addr, label, caption }
-}
-
-/// The SYNTH page, header and keyboard strip.
-pub fn build() -> Layout {
-    let mut l = Layout::default();
-    header(&mut l);
-    synth_rows(&mut l);
-    left_column(&mut l);
-    bottom(&mut l);
-    l
-}
+pub fn display_rect() -> R { R::new(232.0, 12.0, 552.0, 48.0) }
 
 fn header(l: &mut Layout) {
-    // display: [<] name [>]
     let d = display_rect();
-    l.push(None, R::new(d.x + 6.0, d.y + 6.0, 18.0, d.h - 12.0), Kind::PatchPrev);
-    l.push(None, R::new(d.x + 28.0, d.y + 4.0, 196.0, d.h - 8.0), Kind::PatchName);
-    l.push(None, R::new(d.x + 228.0, d.y + 6.0, 18.0, d.h - 12.0), Kind::PatchNext);
-    let tw = 76.0;
-    let mut x = W - MARGIN - 4.0 * tw - 34.0;
-    for p in Page::ALL {
-        l.push(None, R::new(x, 12.0, tw - 4.0, 28.0), Kind::Tab(p));
-        x += tw;
+    l.push(None, R::new(d.x + 4.0, d.y + 5.0, 26.0, d.h - 10.0), Kind::PatchPrev);
+    l.push(None, R::new(d.x + 34.0, d.y + 4.0, 216.0, d.h - 8.0), Kind::PatchName);
+    l.push(None, R::new(d.x + 250.0, d.y + 5.0, 26.0, d.h - 10.0), Kind::PatchNext);
+    for (i, p) in Page::ALL.iter().enumerate() {
+        l.push(None, R::new(826.0 + i as f32 * 108.0, 14.0, 102.0, 44.0), Kind::Tab(*p));
     }
-    l.push(None, R::new(W - MARGIN - 28.0, 14.0, 28.0, 24.0), Kind::Zoom);
+    l.push(None, R::new(W - MARGIN - 40.0, 25.0, 40.0, 24.0), Kind::Zoom);
 }
 
-pub fn display_rect() -> R {
-    R::new(318.0, 7.0, 470.0, 38.0)
-}
+/// Every primary control follows a sound-design task; advanced routing lives on MOD.
+fn instrument(l: &mut Layout) {
+    let p = Some(Page::Synth);
+    // The two sound sources are paired, with tuning adjacent to their waveforms.
+    switch(l, p, R::new(180.0, 172.0, 148.0, 28.0), a::Osc1Wave, icons(&[Icon::Triangle, Icon::Saw, Icon::Pulse, Icon::Square]), t::ORANGE);
+    label(l, p, "OCTAVE", 180.0, 211.0, 0.0);
+    l.push(p, R::new(234.0, 204.0, 94.0, 26.0), Kind::Stepper { addr: a::Osc1Coarse });
+    switch(l, p, R::new(180.0, 280.0, 148.0, 28.0), a::Osc2Wave, icons(&[Icon::Sine, Icon::Saw, Icon::Pulse, Icon::Noise]), t::ORANGE);
+    label(l, p, "SEMITONES", 34.0, 357.0, 0.0);
+    l.push(p, R::new(104.0, 342.0, 78.0, 26.0), Kind::Stepper { addr: a::Osc2Coarse });
+    knob(l, p, 218.0, 314.0, 58.0, 14.0, a::Osc2Finetune, "FINE", t::ORANGE, true);
+    l.push(p, R::new(254.0, 342.0, 74.0, 26.0), Kind::Toggle { addr: a::Osc2Mode, label: "LOW FREQ", color: t::ORANGE });
+    // Blend sits after both oscillators, rather than beside unrelated filters.
+    l.push(p, R::new(34.0, 400.0, 294.0, 24.0), Kind::HSlider { addr: a::OscMix, color: t::ORANGE, bipolar: true });
+    knob(l, p, 66.0, 442.0, 64.0, 16.0, a::OscCrossMod, "CROSS MOD", t::ORANGE, false);
+    knob(l, p, 146.0, 442.0, 64.0, 16.0, a::OscPwmAmount, "PULSE WIDTH", t::ORANGE, false);
+    label(l, p, "PWM SOURCE", 202.0, 445.0, 0.0);
+    switch(l, p, R::new(200.0, 452.0, 128.0, 24.0), a::OscPwmMode, texts(&["ENV", "MAN", "LFO"]), t::ORANGE);
+    label(l, p, "SYNC", 200.0, 493.0, 0.0);
+    switch(l, p, R::new(236.0, 482.0, 92.0, 24.0), a::OscSyncSelect, texts(&["2→1", "OFF", "1→2"]), t::ORANGE);
 
-fn synth_rows(l: &mut Layout) {
-    let p = Page::Synth;
-    let row_a = vec![
-        SectionSpec {
-            title: "LFO",
-            accent: t::YELLOW,
-            cols: vec![
-                fader(a::LFO_RateUnSynced, "RATE"),
-                fader(a::LFO_FadeDelay, "DELAY"),
-                stack(
-                    SWITCH_W,
-                    vec![
-                        sw(a::LFO_Waveform, icons(&[Icon::Sine, Icon::RevSaw, Icon::Square, Icon::SampleHold]), &[0, 1, 2, 3], Some("WAVE")),
-                        Stacked::Space(4.0),
-                        toggle(a::LFO_MidiSync, "SYNC", None),
-                        toggle(a::LFO_Retrig, "KEY", None),
-                    ],
-                ),
-            ],
-        },
-        SectionSpec {
-            title: "VCO MOD",
-            accent: t::YELLOW,
-            cols: vec![
-                fader(a::OscLfoAmount, "LFO"),
-                fader(a::OscEnvAmount, "ENV-1"),
-                stack(SWITCH_W + 4.0, vec![sw(a::OscDestSelect, texts(&["VCO-2", "1 + 2", "VCO-1"]), &[2, 1, 0], Some("DEST"))]),
-            ],
-        },
-        SectionSpec {
-            title: "PWM",
-            accent: t::YELLOW,
-            cols: vec![
-                fader(a::OscPwmAmount, "PW"),
-                stack(SWITCH_W + 4.0, vec![sw(a::OscPwmMode, texts(&["ENV-1", "MAN", "LFO"]), &[0, 1, 2], Some("SOURCE"))]),
-            ],
-        },
-        SectionSpec {
-            title: "VCO-1",
-            accent: t::ORANGE,
-            cols: vec![
-                fader(a::OscCrossMod, "X-MOD"),
-                stack(SWITCH_W, vec![sw(a::Osc1Coarse, texts(&["16'", "8'", "4'", "2'"]), &[0, 1, 2, 3], Some("RANGE"))]),
-                stack(
-                    SWITCH_W,
-                    vec![sw(a::Osc1Wave, icons(&[Icon::Triangle, Icon::Saw, Icon::Pulse, Icon::Square]), &[0, 1, 2, 3], Some("WAVE"))],
-                ),
-            ],
-        },
-        SectionSpec {
-            title: "VCO-2",
-            accent: t::ORANGE,
-            cols: vec![
-                stack(
-                    SWITCH_W + 4.0,
-                    vec![
-                        sw(a::OscSyncSelect, texts(&["2 > 1", "OFF", "1 > 2"]), &[0, 1, 2], Some("SYNC")),
-                        Stacked::Space(4.0),
-                        toggle(a::Osc2Mode, "LOW FREQ", None),
-                    ],
-                ),
-                Col::Fader { addr: a::Osc2Coarse, label: "RANGE", origin: 12.0 / 36.0 },
-                bipolar(a::Osc2Finetune, "FINE"),
-                stack(
-                    SWITCH_W,
-                    vec![sw(a::Osc2Wave, icons(&[Icon::Sine, Icon::Saw, Icon::Pulse, Icon::Noise]), &[0, 1, 2, 3], Some("WAVE"))],
-                ),
-            ],
-        },
-        SectionSpec {
-            title: "MIXER",
-            accent: t::ORANGE,
-            cols: vec![bipolar(a::OscMix, "MIX"), fader(a::HPF_Cutoff, "HPF")],
-        },
-    ];
-    row(l, p, RIGHT_X, BODY_TOP, RIGHT_W, ROW_H, row_a);
+    // The tone stage gets the largest gesture and a direct-manipulation response graph.
+    knob(l, p, 432.0, 284.0, 106.0, 31.0, a::LpfCut, "CUTOFF", t::BLUE, false);
+    knob(l, p, 542.0, 296.0, 90.0, 21.0, a::LpfRes, "RESONANCE", t::BLUE, false);
+    knob(l, p, 638.0, 296.0, 88.0, 21.0, a::HPF_Cutoff, "HIGH PASS", t::BLUE, false);
+    knob(l, p, 738.0, 296.0, 100.0, 21.0, a::LpfEnvAmount, "ENV DEPTH", t::RED, false);
+    label(l, p, "SLOPE", 802.0, 292.0, 0.0);
+    switch(l, p, R::new(802.0, 300.0, 98.0, 24.0), a::LpfSlop, texts(&["12 dB", "24 dB"]), t::BLUE);
+    label(l, p, "ENVELOPE", 802.0, 336.0, 0.0);
+    switch(l, p, R::new(802.0, 344.0, 98.0, 24.0), a::LpfEnvSource, texts(&["ENV 1", "ENV 2"]), t::RED);
+    label(l, p, "KEY TRACK", 652.0, 391.0, 0.0);
+    l.push(p, R::new(718.0, 381.0, 182.0, 18.0), Kind::HSlider { addr: a::LPF_KeyFollowAmount, color: t::BLUE, bipolar: false });
+    for (source, addrs) in [[a::Env1_Attack, a::Env1_Decay, a::Env1_Sustain, a::Env1_Release], [a::Env2_Attack, a::Env2_Decay, a::Env2_Sustain, a::Env2Release]].iter().enumerate() {
+        for (i, (&addr, &name)) in addrs.iter().zip(["ATTACK", "DECAY", "SUSTAIN", "RELEASE"].iter()).enumerate() {
+            let before = l.controls.len();
+            knob(l, p, 656.0 + i as f32 * 68.0, 422.0, 64.0, 14.0, addr, name, t::RED, false);
+            l.controls[before].when = Some((a::LpfEnvSource, source));
+        }
+    }
+    // Amplitude always follows ENV 2. Voice behavior sits immediately below it.
+    for (i, (&addr, &name)) in [a::Env2_Attack, a::Env2_Decay, a::Env2_Sustain, a::Env2Release].iter().zip(["ATTACK", "DECAY", "SUSTAIN", "RELEASE"].iter()).enumerate() {
+        knob(l, p, 988.0 + i as f32 * 86.0, 266.0, 80.0, 16.0, addr, name, t::RED, false);
+    }
+    switch(l, p, R::new(948.0, 350.0, 338.0, 26.0), a::AssignMode, texts(&["MONO", "UNISON", "POLY 1", "POLY 2"]), t::INK);
+    label(l, p, "VOICES", 948.0, 408.0, 0.0);
+    for mode in [0, 2, 3] {
+        l.push_when(p, R::new(1006.0, 392.0, 80.0, 26.0), Kind::Stepper { addr: a::Polyphon }, a::AssignMode, mode);
+    }
+    l.push_when(p, R::new(1006.0, 392.0, 80.0, 26.0), Kind::Stepper { addr: a::UniVPN }, a::AssignMode, 1);
+    label(l, p, "PORTAMENTO", 1110.0, 408.0, 0.0);
+    l.push(p, R::new(1228.0, 392.0, 58.0, 26.0), Kind::Toggle { addr: a::Portamento_On, label: "GLIDE", color: t::INK });
+    for mode in [0, 2, 3] {
+        let before = l.controls.len();
+        knob(l, p, 990.0, 430.0, 84.0, 20.0, a::VCA_EnvAmount, "LEVEL", t::INK, false);
+        l.controls[before].when = Some((a::AssignMode, mode));
+    }
+    let before = l.controls.len();
+    knob(l, p, 990.0, 430.0, 84.0, 20.0, a::VoiceDetuneAmount, "DETUNE", t::INK, false);
+    l.controls[before].when = Some((a::AssignMode, 1));
+    knob(l, p, 1110.0, 430.0, 100.0, 20.0, a::PanSpread, "WIDTH", t::INK, false);
+    knob(l, p, 1230.0, 430.0, 100.0, 20.0, a::Portamento_Time, "GLIDE TIME", t::INK, false);
 
-    let row_b = vec![
-        SectionSpec {
-            title: "VCF",
-            accent: t::BLUE,
-            cols: vec![
-                fader(a::LpfCut, "FREQ"),
-                fader(a::LpfRes, "RES"),
-                stack(
-                    SWITCH_W,
-                    vec![
-                        sw(a::LpfSlop, texts(&["-12", "-24"]), &[1, 0], Some("SLOPE")),
-                        Stacked::Space(6.0),
-                        sw(a::LpfEnvSource, texts(&["ENV-1", "ENV-2"]), &[0, 1], Some("ENV")),
-                    ],
-                ),
-                fader(a::LpfEnvAmount, "ENV"),
-                fader(a::LfoFiltAmount, "LFO"),
-                fader(a::LPF_KeyFollowAmount, "KYBD"),
-            ],
-        },
-        SectionSpec { title: "VCA", accent: t::BLUE, cols: vec![fader(a::VCA_EnvAmount, "LEVEL"), fader(a::VCA_LfoAmount, "LFO")] },
-        SectionSpec {
-            title: "ENV-1",
-            accent: t::RED,
-            cols: vec![
-                fader(a::Env1_Attack, "A"),
-                fader(a::Env1_Decay, "D"),
-                fader(a::Env1_Sustain, "S"),
-                fader(a::Env1_Release, "R"),
-                stack(SWITCH_W + 6.0, vec![toggle(a::Env1_KeyFollow, "KEY FLW", None), toggle(a::Env1_Polarity, "INVERT", None)]),
-            ],
-        },
-        SectionSpec {
-            title: "ENV-2",
-            accent: t::RED,
-            cols: vec![
-                fader(a::Env2_Attack, "A"),
-                fader(a::Env2_Decay, "D"),
-                fader(a::Env2_Sustain, "S"),
-                fader(a::Env2Release, "R"),
-                stack(SWITCH_W + 6.0, vec![toggle(a::Env2_KeyFollow, "KEY FLW", None)]),
-            ],
-        },
-    ];
-    row(l, p, RIGHT_X, BODY_TOP + ROW_H + GAP, RIGHT_W, ROW_H, row_b);
-}
-
-fn left_column(l: &mut Layout) {
-    let p = Page::Synth;
-    let x = MARGIN;
-    let w = LEFT_W;
-    let total = 2.0 * ROW_H + GAP;
-    let (h1, h2) = (116.0, 184.0);
-    let h3 = total - h1 - h2 - 2.0 * GAP;
-    let knob = |l: &mut Layout, cx: f32, y: f32, addr: usize, label: &'static str, color: Rgba, bipolar: bool, radius: f32| {
-        l.push(Some(p), R::new(cx - 30.0, y, 60.0, 2.0 * radius + 34.0), Kind::Knob { addr, label, color, bipolar, radius });
-    };
-    // MASTER: volume, tune, glide (+ on)
-    let y = BODY_TOP;
-    l.deco(Some(p), Deco::Section { r: R::new(x, y, w, h1), title: "MASTER", accent: t::WHITE_KEY });
-    let ky = y + 36.0;
-    knob(l, x + 46.0, ky, a::Volume, "VOLUME", t::WHITE_KEY, false, 18.0);
-    knob(l, x + 116.0, ky, a::MasterTune, "TUNE", t::WHITE_KEY, true, 18.0);
-    knob(l, x + 186.0, ky, a::Portamento_Time, "GLIDE", t::WHITE_KEY, false, 18.0);
-    l.push(Some(p), R::new(x + w - 12.0 - 24.0, ky + 13.0, 24.0, 18.0), Kind::Toggle { addr: a::Portamento_On, label: "ON", color: t::WHITE_KEY });
-
-    // ASSIGN
-    let y = BODY_TOP + h1 + GAP;
-    l.deco(Some(p), Deco::Section { r: R::new(x, y, w, h2), title: "ASSIGN", accent: t::RED });
-    l.push(
-        Some(p),
-        R::new(x + 12.0, y + 36.0, w - 24.0, ITEM_H),
-        Kind::Switch { addr: a::AssignMode, items: texts(&["SOLO", "UNISON", "POLY 1", "POLY 2"]), order: vec![0, 1, 2, 3], color: t::RED, vertical: false },
-    );
-    let ry = y + 72.0;
-    let lx = x + 12.0;
-    let bx = x + 72.0;
-    l.deco(Some(p), Deco::Label { text: "VOICES", x: lx, y: ry + 12.5, align: 0.0 });
-    l.push(Some(p), R::new(bx, ry, 74.0, 18.0), Kind::Stepper { addr: a::Polyphon });
-    l.deco(Some(p), Deco::Label { text: "UNISON", x: lx, y: ry + 37.5, align: 0.0 });
-    l.push(Some(p), R::new(bx, ry + 25.0, 74.0, 18.0), Kind::Stepper { addr: a::UniVPN });
-    l.deco(Some(p), Deco::Label { text: "PRIORITY", x: lx, y: ry + 62.5, align: 0.0 });
-    l.push(
-        Some(p),
-        R::new(bx, ry + 50.0, 74.0, 18.0),
-        Kind::Switch { addr: a::PlPrio, items: texts(&["LO", "HI", "LAST"]), order: vec![0, 1, 2], color: t::RED, vertical: false },
-    );
-    knob(l, x + 182.0, ry - 2.0, a::VoiceDetuneAmount, "DETUNE", t::RED, false, 15.0);
-    l.deco(Some(p), Deco::Label { text: "SPREAD", x: lx, y: ry + 87.5, align: 0.0 });
-    l.push(Some(p), R::new(bx - 6.0, ry + 75.0, 86.0, 18.0), Kind::HSlider { addr: a::PanSpread, color: t::RED, bipolar: false });
-
-    // ARPEGGIO
-    let y = BODY_TOP + h1 + h2 + 2.0 * GAP;
-    l.deco(Some(p), Deco::Section { r: R::new(x, y, w, h3), title: "ARPEGGIO", accent: t::ORANGE });
-    l.push(Some(p), R::new(x + w - 12.0 - 38.0, y + 8.0, 38.0, 18.0), Kind::Toggle { addr: a::ArpSeq_ArpSeqMode, label: "ON", color: t::ORANGE });
-    let gy = y + 38.0;
-    l.push(
-        Some(p),
-        R::new(x + 12.0, gy, w - 24.0, ITEM_H),
-        Kind::Switch { addr: a::ArpSeq_PatternMode, items: texts(&["UP", "DOWN", "ORD", "REV", "U/D", "U/D2", "RND"]), order: vec![0, 1, 2, 3, 4, 5, 6], color: t::ORANGE, vertical: false },
-    );
-    let ry = gy + 36.0;
-    l.deco(Some(p), Deco::Label { text: "RANGE", x: lx, y: ry + 12.5, align: 0.0 });
-    l.push(
-        Some(p),
-        R::new(bx, ry, 100.0, 18.0),
-        Kind::Switch { addr: a::ArpSeq_OctaveRepeat, items: texts(&["1", "2", "3", "4"]), order: vec![0, 1, 2, 3], color: t::ORANGE, vertical: false },
-    );
-    l.deco(Some(p), Deco::Label { text: "CLOCK", x: lx, y: ry + 37.5, align: 0.0 });
-    l.push(Some(p), R::new(bx, ry + 25.0, 100.0, 18.0), Kind::Switch { addr: a::ArpSeq_MidiSync, items: texts(&["FREE", "HOST"]), order: vec![0, 1], color: t::WHITE_KEY, vertical: false });
-    l.deco(Some(p), Deco::Label { text: "DIVISION", x: lx, y: ry + 62.5, align: 0.0 });
-    l.push(Some(p), R::new(bx, ry + 50.0, 100.0, 18.0), Kind::Stepper { addr: a::ArpSeq_RateSynced });
-    knob(l, x + 214.0, ry + 4.0, a::ArpSeq_RateUnSynced, "RATE", t::ORANGE, false, 17.0);
+    // Musical motion is a horizontal strip with explicit clock semantics.
+    label(l, p, "SHAPE", 34.0, 575.0, 0.0);
+    switch(l, p, R::new(34.0, 584.0, 160.0, 28.0), a::LFO_Waveform, icons(&[Icon::Sine, Icon::RevSaw, Icon::Square, Icon::SampleHold]), t::YELLOW);
+    label(l, p, "CLOCK", 210.0, 575.0, 0.0);
+    switch(l, p, R::new(210.0, 584.0, 100.0, 28.0), a::LFO_MidiSync, texts(&["HZ", "SYNC"]), t::YELLOW);
+    let before = l.controls.len();
+    knob(l, p, 362.0, 562.0, 88.0, 17.0, a::LFO_RateUnSynced, "RATE", t::YELLOW, false);
+    l.controls[before].when = Some((a::LFO_MidiSync, 0));
+    l.push_when(p, R::new(322.0, 584.0, 80.0, 28.0), Kind::Stepper { addr: a::LFO_RateSynced }, a::LFO_MidiSync, 1);
+    knob(l, p, 452.0, 562.0, 88.0, 17.0, a::OscLfoAmount, "PITCH", t::YELLOW, false);
+    knob(l, p, 542.0, 562.0, 88.0, 17.0, a::LfoFiltAmount, "FILTER", t::YELLOW, false);
+    knob(l, p, 626.0, 562.0, 70.0, 17.0, a::VCA_LfoAmount, "AMP", t::YELLOW, false);
+    // Arpeggio is a playable rhythm section, not a remote sidebar.
+    l.push(p, R::new(1246.0, 542.0, 40.0, 24.0), Kind::Toggle { addr: a::ArpSeq_ArpSeqMode, label: "ON", color: t::ORANGE });
+    label(l, p, "PATTERN", 694.0, 575.0, 0.0);
+    l.push(p, R::new(694.0, 584.0, 174.0, 28.0), Kind::Stepper { addr: a::ArpSeq_PatternMode });
+    label(l, p, "OCTAVES", 882.0, 575.0, 0.0);
+    switch(l, p, R::new(882.0, 584.0, 116.0, 28.0), a::ArpSeq_OctaveRepeat, texts(&["1", "2", "3", "4"]), t::ORANGE);
+    label(l, p, "CLOCK", 1012.0, 575.0, 0.0);
+    switch(l, p, R::new(1012.0, 584.0, 106.0, 28.0), a::ArpSeq_MidiSync, texts(&["HZ", "SYNC"]), t::ORANGE);
+    let before = l.controls.len();
+    knob(l, p, 1202.0, 562.0, 130.0, 17.0, a::ArpSeq_RateUnSynced, "RATE", t::ORANGE, false);
+    l.controls[before].when = Some((a::ArpSeq_MidiSync, 0));
+    l.push_when(p, R::new(1132.0, 584.0, 154.0, 28.0), Kind::Stepper { addr: a::ArpSeq_RateSynced }, a::ArpSeq_MidiSync, 1);
 }
 
 fn bottom(l: &mut Layout) {
-    let y = BOTTOM_TOP;
-    let h = BOTTOM_H;
-    let x = MARGIN;
-    let w = LEFT_W;
-    l.deco(None, Deco::Section { r: R::new(x, y, w, h), title: "BENDER", accent: t::WHITE_KEY });
-    // wheels
-    let wy = y + 32.0;
-    let wh = h - 58.0;
-    l.push(None, R::new(x + 16.0, wy, 20.0, wh), Kind::Bender);
-    l.push(None, R::new(x + 46.0, wy, 20.0, wh), Kind::ModWheel);
-    // routing grid: label | VCO-1 VCO-2 | VCF | amount
-    let gx = x + 80.0;
-    let col = [gx + 34.0, gx + 72.0, gx + 110.0];
-    l.deco(None, Deco::Label { text: "BEND", x: gx, y: wy + 12.5, align: 0.0 });
-    l.push(None, R::new(col[0], wy, 34.0, 18.0), Kind::Toggle { addr: a::BendVCO1, label: "VCO1", color: t::WHITE_KEY });
-    l.push(None, R::new(col[1], wy, 34.0, 18.0), Kind::Toggle { addr: a::BendVCO2, label: "VCO2", color: t::WHITE_KEY });
-    l.push(None, R::new(col[2], wy, 34.0, 18.0), Kind::Toggle { addr: a::BendVCF, label: "VCF", color: t::WHITE_KEY });
-    l.deco(None, Deco::Label { text: "RANGE", x: gx, y: wy + 37.5, align: 0.0 });
-    l.push(None, R::new(col[0], wy + 25.0, 72.0, 18.0), Kind::Stepper { addr: a::BendVCOAmount });
-    l.push(None, R::new(col[2], wy + 25.0, 34.0, 18.0), Kind::HSlider { addr: a::BendVCFAmount, color: t::WHITE_KEY, bipolar: false });
-    l.deco(None, Deco::Label { text: "LEVER", x: gx, y: wy + 62.5, align: 0.0 });
-    l.push(None, R::new(col[0], wy + 50.0, 34.0, 18.0), Kind::Toggle { addr: a::LfoModVCO, label: "VCO", color: t::WHITE_KEY });
-    l.push(None, R::new(col[1], wy + 50.0, 72.0, 18.0), Kind::HSlider { addr: a::LfoModVCOAmount, color: t::WHITE_KEY, bipolar: false });
-    l.push(None, R::new(col[0], wy + 75.0, 34.0, 18.0), Kind::Toggle { addr: a::LfoModVCF, label: "VCF", color: t::WHITE_KEY });
-    l.push(None, R::new(col[1], wy + 75.0, 72.0, 18.0), Kind::HSlider { addr: a::LfoModVcfAmount, color: t::WHITE_KEY, bipolar: false });
-    // keyboard
-    l.push(None, R::new(RIGHT_X, y, RIGHT_W, h), Kind::Keyboard);
+    knob(l, None, 55.0, BOTTOM_TOP + 17.0, 72.0, 20.0, a::Volume, "OUTPUT", t::INK, false);
+    l.push(None, R::new(110.0, BOTTOM_TOP + 14.0, 20.0, 56.0), Kind::Bender);
+    l.push(None, R::new(144.0, BOTTOM_TOP + 14.0, 20.0, 56.0), Kind::ModWheel);
+    l.push(None, R::new(RIGHT_X, BOTTOM_TOP, RIGHT_W, BOTTOM_H), Kind::Keyboard);
 }
 
-/// First and last MIDI note of the on-screen keyboard.
 pub const KEY_LO: u8 = 36;
 pub const KEY_HI: u8 = 96;
 
-/// Every page.
+pub fn build() -> Layout {
+    let mut l = Layout::default();
+    header(&mut l);
+    instrument(&mut l);
+    bottom(&mut l);
+    l
+}
 pub fn build_all() -> Layout {
     let mut l = build();
     crate::pages::layout(&mut l);

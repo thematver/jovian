@@ -7,12 +7,14 @@ use jovian_core::dsp::{HostTime, Meters, SynthEngine};
 use nih_plug::prelude::*;
 use params::JovianParams;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 /// MIDI-like events the editor sends to the audio thread (on-screen keyboard, wheels).
 #[derive(Debug, Clone, Copy)]
 pub struct GuiMidi(pub u8, pub u8, pub u8);
+
+const GUI_MIDI_CAPACITY: usize = 256;
 
 /// State shared between the audio thread and the editor.
 pub struct Shared {
@@ -23,8 +25,61 @@ pub struct Shared {
     pub env2: AtomicF32,
     pub comp_reduction: [AtomicF32; 3],
     pub sample_rate: AtomicF32,
+    pub tempo_bpm: AtomicF32,
     /// Editor -> audio thread note and controller messages.
-    pub gui_midi: crossbeam::queue::ArrayQueue<GuiMidi>,
+    gui_midi: crossbeam::queue::ArrayQueue<GuiMidi>,
+    /// A full queue may have lost a note-off. Suppress new events until the audio thread
+    /// discards the stale burst and releases the notes it received from the editor.
+    gui_midi_overflow: AtomicBool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gated_voices(plugin: &mut Jovian8) -> u16 {
+        plugin.engine.render(&mut [0.0; 32], &mut [0.0; 32], HostTime::default());
+        plugin.engine.meters.gated_voices
+    }
+
+    #[test]
+    fn queue_overflow_releases_editor_notes_and_accepts_new_input() {
+        let mut plugin = Jovian8::default();
+        plugin.shared.send_gui_midi(GuiMidi(0x90, 60, 100));
+        plugin.process_gui_midi();
+        assert_ne!(gated_voices(&mut plugin), 0);
+
+        // Simulate moving a wheel while the host has suspended audio, followed by
+        // a release that would previously have been silently discarded.
+        for _ in 0..GUI_MIDI_CAPACITY {
+            plugin.shared.send_gui_midi(GuiMidi(0xB0, 1, 127));
+        }
+        plugin.shared.send_gui_midi(GuiMidi(0x80, 60, 0));
+        plugin.shared.send_gui_midi(GuiMidi(0x90, 62, 100));
+        assert!(plugin.shared.gui_midi_overflow.load(Ordering::Acquire));
+        plugin.process_gui_midi();
+        assert_eq!(gated_voices(&mut plugin), 0);
+        assert!(plugin.shared.gui_midi.is_empty());
+        assert!(!plugin.shared.gui_midi_overflow.load(Ordering::Acquire));
+
+        plugin.shared.send_gui_midi(GuiMidi(0x90, 64, 100));
+        plugin.process_gui_midi();
+        assert_ne!(gated_voices(&mut plugin), 0);
+        plugin.shared.send_gui_midi(GuiMidi(0x80, 64, 0));
+        plugin.process_gui_midi();
+        assert_eq!(gated_voices(&mut plugin), 0);
+    }
+
+    #[test]
+    fn overflowing_an_idle_editor_does_not_stop_host_notes() {
+        let mut plugin = Jovian8::default();
+        plugin.engine.note_on(48, 1.0);
+        for _ in 0..=GUI_MIDI_CAPACITY {
+            plugin.shared.send_gui_midi(GuiMidi(0xB0, 1, 127));
+        }
+        plugin.process_gui_midi();
+        assert_ne!(gated_voices(&mut plugin), 0);
+    }
 }
 
 impl Default for Shared {
@@ -37,12 +92,23 @@ impl Default for Shared {
             env2: AtomicF32::new(0.0),
             comp_reduction: [AtomicF32::new(0.0), AtomicF32::new(0.0), AtomicF32::new(0.0)],
             sample_rate: AtomicF32::new(48_000.0),
-            gui_midi: crossbeam::queue::ArrayQueue::new(256),
+            tempo_bpm: AtomicF32::new(120.0),
+            gui_midi: crossbeam::queue::ArrayQueue::new(GUI_MIDI_CAPACITY),
+            gui_midi_overflow: AtomicBool::new(false),
         }
     }
 }
 
 impl Shared {
+    pub fn send_gui_midi(&self, message: GuiMidi) {
+        if self.gui_midi_overflow.load(Ordering::Acquire) {
+            return;
+        }
+        if self.gui_midi.push(message).is_err() {
+            self.gui_midi_overflow.store(true, Ordering::Release);
+        }
+    }
+
     pub fn meters(&self) -> Meters {
         Meters {
             active_voices: self.active_voices.load(Ordering::Relaxed) as u16,
@@ -62,6 +128,9 @@ pub struct Jovian8 {
     prepared: Option<(f32, u32)>,
     mono_l: Vec<f32>,
     mono_r: Vec<f32>,
+    gui_notes: [bool; 128],
+    gui_bend_used: bool,
+    gui_mod_used: bool,
 }
 
 impl Default for Jovian8 {
@@ -74,11 +143,63 @@ impl Default for Jovian8 {
             prepared: None,
             mono_l: vec![0.0; 4096],
             mono_r: vec![0.0; 4096],
+            gui_notes: [false; 128],
+            gui_bend_used: false,
+            gui_mod_used: false,
         }
     }
 }
 
 impl Jovian8 {
+    fn handle_gui_midi(&mut self, GuiMidi(status, d1, d2): GuiMidi) {
+        match (status & 0xF0, d1) {
+            (0xE0, _) => self.gui_bend_used = true,
+            (0xB0, 1) => self.gui_mod_used = true,
+            _ => {}
+        }
+        if let Some(held) = self.gui_notes.get_mut(d1 as usize) {
+            match status & 0xF0 {
+                0x90 if d2 > 0 => *held = true,
+                0x80 | 0x90 => *held = false,
+                _ => {}
+            }
+        }
+        self.engine.handle_midi(status, d1, d2);
+    }
+
+    fn process_gui_midi(&mut self) {
+        // Bound GUI work per callback, even when a producer is still adding events.
+        // On overflow none of the queued events is reliable: a corresponding note-off
+        // may have been discarded while audio processing was suspended.
+        if self.shared.gui_midi_overflow.load(Ordering::Acquire) {
+            for _ in 0..GUI_MIDI_CAPACITY {
+                if self.shared.gui_midi.pop().is_none() {
+                    break;
+                }
+            }
+            for (note, held) in self.gui_notes.iter_mut().enumerate() {
+                if *held {
+                    self.engine.note_off(note as i32);
+                    *held = false;
+                }
+            }
+            if self.gui_bend_used {
+                self.engine.set_pitch_bend(0.0);
+                self.gui_bend_used = false;
+            }
+            if self.gui_mod_used {
+                self.engine.set_mod_wheel(0.0);
+                self.gui_mod_used = false;
+            }
+            self.shared.gui_midi_overflow.store(false, Ordering::Release);
+            return;
+        }
+        for _ in 0..GUI_MIDI_CAPACITY {
+            let Some(message) = self.shared.gui_midi.pop() else { break };
+            self.handle_gui_midi(message);
+        }
+    }
+
     fn handle_event(&mut self, ev: NoteEvent<()>) {
         let e = &mut self.engine;
         match ev {
@@ -90,10 +211,16 @@ impl Jovian8 {
                 }
             }
             NoteEvent::NoteOff { note, .. } => e.note_off(note as i32),
-            NoteEvent::MidiCC { cc, value, .. } => e.handle_midi(0xB0, cc, (value * 127.0).round() as u8),
+            NoteEvent::MidiCC { cc, value, .. } => {
+                if cc == 1 {
+                    self.gui_mod_used = false;
+                }
+                e.handle_midi(0xB0, cc, (value * 127.0).round() as u8)
+            }
             NoteEvent::MidiChannelPressure { pressure, .. } => e.handle_midi(0xD0, (pressure * 127.0).round() as u8, 0),
             NoteEvent::PolyPressure { note, pressure, .. } => e.handle_midi(0xA0, note, (pressure * 127.0).round() as u8),
             NoteEvent::MidiPitchBend { value, .. } => {
+                self.gui_bend_used = false;
                 let v = (value * 16383.0).round().clamp(0.0, 16383.0) as u16;
                 e.handle_midi(0xE0, (v & 0x7F) as u8, (v >> 7) as u8)
             }
@@ -156,21 +283,21 @@ impl Plugin for Jovian8 {
 
     fn reset(&mut self) {
         self.engine.reset();
+        self.gui_notes.fill(false);
     }
 
     fn process(&mut self, buffer: &mut Buffer, _aux: &mut AuxiliaryBuffers, context: &mut impl ProcessContext<Self>) -> ProcessStatus {
         for (i, h) in self.params.list.iter().enumerate() {
             self.engine.params[i] = h.normalized();
         }
-        while let Some(GuiMidi(a, b, c)) = self.shared.gui_midi.pop() {
-            self.engine.handle_midi(a, b, c);
-        }
+        self.process_gui_midi();
         let t = context.transport();
         let time = HostTime {
             tempo: t.tempo.filter(|x| *x > 0.0).unwrap_or(120.0),
             beat_position: t.pos_beats().unwrap_or(0.0),
             is_playing: t.playing,
         };
+        self.shared.tempo_bpm.store(time.tempo as f32, Ordering::Relaxed);
         let sr = self.engine.sample_rate();
         let n = buffer.samples();
         let channels = buffer.as_slice();

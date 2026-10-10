@@ -1,7 +1,7 @@
 //! The editor: owns the layout and interaction state, turns input events into parameter
 //! changes and draws everything. Host and window agnostic.
 
-use crate::canvas::{vgrad, Canvas, Fill, Rgba, R};
+use crate::canvas::{vgrad, Canvas, Rgba, R};
 use crate::display;
 use crate::host::{index_of, Host};
 use crate::layout::{self, Control, Deco, Kind, Layout, Page};
@@ -51,6 +51,8 @@ pub enum Event {
     Up { x: f32, y: f32, button: Button, mods: Mods },
     Move { x: f32, y: f32, mods: Mods },
     Leave,
+    /// The host lost focus or is closing the editor.
+    Cancel,
     /// Lines (positive = up / away from the user).
     Wheel { dx: f32, dy: f32, mods: Mods },
     Key { key: Key, mods: Mods },
@@ -93,6 +95,11 @@ pub struct Menu {
 
 pub const ZOOMS: [u32; 6] = [75, 85, 100, 115, 125, 150];
 
+/// Persisted editor state must never request an empty or unbounded bitmap.
+pub fn valid_zoom(zoom: u32) -> u32 {
+    if ZOOMS.contains(&zoom) { zoom } else { 100 }
+}
+
 pub struct Ui {
     pub fonts: Fonts,
     pub layout: Layout,
@@ -124,6 +131,8 @@ pub struct Ui {
     had_overlay: bool,
     force_full: bool,
     focus_shown: bool,
+    tempo: f64,
+    pending_patch_steps: i64,
 }
 
 /// Signatures of what the last frame showed.
@@ -164,7 +173,7 @@ impl Default for Sig {
 /// Area a control may paint (shadows, glows, value labels).
 fn bounds(c: &Control) -> R {
     match c.kind {
-        Kind::Fader { .. } => c.r.inset_xy(-16.0, -6.0),
+        Kind::Fader { .. } => c.r.inset_xy(-16.0, -22.0),
         Kind::Knob { .. } => c.r.inset(-6.0),
         Kind::Bender | Kind::ModWheel => R::new(c.r.x - 8.0, c.r.y - 4.0, c.r.w + 12.0, c.r.h + 20.0),
         Kind::Keyboard => c.r.inset(-2.0),
@@ -178,7 +187,7 @@ impl Ui {
             fonts: Fonts::new(),
             layout: layout::build_all(),
             page,
-            zoom,
+            zoom: valid_zoom(zoom),
             hover: None,
             drag: None,
             last_click: None,
@@ -203,6 +212,8 @@ impl Ui {
             had_overlay: false,
             force_full: true,
             focus_shown: false,
+            tempo: 120.0,
+            pending_patch_steps: 0,
         }
     }
 
@@ -238,6 +249,14 @@ impl Ui {
 
     /// Polls the host for changes; returns true if a redraw is needed.
     pub fn tick(&mut self, host: &dyn Host) -> bool {
+        if self.page == Page::Library {
+            self.library.ensure_scanned();
+        }
+        let tempo = host.tempo_bpm();
+        if tempo != self.tempo {
+            self.tempo = tempo;
+            self.dirty = true;
+        }
         let (name, bank, generation) = host.patch_info();
         if generation != self.patch_gen {
             self.patch_gen = generation;
@@ -277,6 +296,10 @@ impl Ui {
         }
         if self.library.poll() {
             self.dirty = true;
+            let pending = std::mem::take(&mut self.pending_patch_steps);
+            if pending != 0 {
+                self.step_patch(host, pending);
+            }
         }
         let shown = display::focus(self).is_some();
         if shown != self.focus_shown {
@@ -293,14 +316,19 @@ impl Ui {
 
     fn visible(&self, c: &Control) -> bool {
         c.page.map_or(true, |p| p == self.page)
+            && c.view.map_or(true, |view| match self.page {
+                Page::Mod => self.page_state.mod_source == view,
+                Page::Fx => self.page_state.fx_selected == view,
+                _ => true,
+            })
             && c.when.map_or(true, |(addr, i)| PARAMS[addr].index_f32(self.values[addr].max(0.0)) == i)
     }
 
-    fn hit(&self, x: f32, y: f32) -> Option<usize> {
+    fn hit(&self, host: &dyn Host, x: f32, y: f32) -> Option<usize> {
         // later controls are on top
         (0..self.layout.controls.len()).rev().find(|&i| {
             let c = &self.layout.controls[i];
-            self.visible(c) && hit_rect(c).contains(x, y)
+            self.visible(c) && !c.kind.addr().is_some_and(|addr| inactive(addr, host)) && hit_rect(c).contains(x, y)
         })
     }
 
@@ -318,11 +346,43 @@ impl Ui {
     // MARK: - events
 
     pub fn event(&mut self, host: &dyn Host, ev: Event) -> Response {
+        if ev == Event::Cancel {
+            self.cancel_interaction(host);
+            return Response { captured: true };
+        }
         let r = self.event_inner(host, ev);
         if r.captured {
             self.dirty = true;
         }
         r
+    }
+
+    /// Balance gestures and release editor-owned MIDI state even without a mouse-up.
+    /// Safe to call again from a window destruction fallback.
+    pub fn cancel_interaction(&mut self, host: &dyn Host) {
+        if let Some(drag) = self.drag.take() {
+            match drag {
+                Drag::Value { addr, .. } => host.end(addr),
+                Drag::Page(id) => pages::area_up(self, host, id),
+                _ => {}
+            }
+        }
+        if let Some(note) = self.held_note.take() {
+            host.midi(0x80, note, 0);
+        }
+        if self.bend != 0.0 {
+            host.midi(0xE0, 0, 64);
+            self.bend = 0.0;
+        }
+        if self.mod_wheel != 0.0 {
+            host.midi(0xB0, 1, 0);
+            self.mod_wheel = 0.0;
+        }
+        self.library.drag_scroll = None;
+        self.hover = None;
+        self.menu = None;
+        self.focus = None;
+        self.dirty = true;
     }
 
     fn event_inner(&mut self, host: &dyn Host, ev: Event) -> Response {
@@ -345,7 +405,7 @@ impl Ui {
                     self.drag_to(host, d, x, y, mods);
                     return captured;
                 }
-                let h = self.hit(x, y);
+                let h = self.hit(host, x, y);
                 if h != self.hover {
                     self.hover = h;
                     if let Some(addr) = h.and_then(|i| self.layout.controls[i].kind.addr()) {
@@ -363,12 +423,16 @@ impl Ui {
                 Response::default()
             }
             Event::Down { x, y, button, mods } => {
+                // Extra mouse buttons must not overwrite an unfinished left-button gesture.
+                if button != Button::Left || self.drag.is_some() {
+                    return captured;
+                }
                 self.mouse = (x, y);
                 if self.menu.is_some() {
                     self.menu_click(host, x, y);
                     return captured;
                 }
-                let Some(i) = self.hit(x, y) else { return Response::default() };
+                let Some(i) = self.hit(host, x, y) else { return Response::default() };
                 let now = Instant::now();
                 let double = matches!(self.last_click, Some((t0, j)) if j == i && now.duration_since(t0) < Duration::from_millis(350));
                 self.last_click = Some((now, i));
@@ -391,17 +455,19 @@ impl Ui {
                         Drag::Page(id) => pages::area_up(self, host, id),
                         _ => {}
                     }
-                    self.hover = self.hit(x, y);
+                    self.hover = self.hit(host, x, y);
                     return captured;
                 }
                 Response::default()
             }
             Event::Wheel { dy, mods, .. } => {
                 if let Some(m) = &mut self.menu {
-                    m.scroll = (m.scroll - dy * 18.0).max(0.0);
+                    let max = (PARAMS[m.addr].item_count() as f32 * 20.0 + 8.0 - m.r.h).max(0.0);
+                    m.scroll = (m.scroll - dy * 18.0).clamp(0.0, max);
+                    m.hover = menu_item_at(m, self.mouse.0, self.mouse.1);
                     return captured;
                 }
-                let Some(i) = self.hit(self.mouse.0, self.mouse.1) else { return Response::default() };
+                let Some(i) = self.hit(host, self.mouse.0, self.mouse.1) else { return Response::default() };
                 self.wheel(host, i, dy, mods);
                 captured
             }
@@ -613,7 +679,13 @@ impl Ui {
 
     /// Loads the previous / next preset of the library list.
     pub fn step_patch(&mut self, host: &dyn Host, dir: i64) {
-        self.library.ensure_scanned_blocking();
+        if dir == 0 { return; }
+        self.library.ensure_scanned();
+        if self.library.is_scanning() {
+            self.pending_patch_steps = self.pending_patch_steps.saturating_add(dir);
+            self.set_status("Reading preset library…");
+            return;
+        }
         let list: Vec<LibraryEntry> = self.library.filtered();
         if list.is_empty() {
             return;
@@ -623,9 +695,9 @@ impl Ui {
             Some(i) => (i as i64 + dir).rem_euclid(list.len() as i64) as usize,
             None => {
                 if dir > 0 {
-                    0
+                    (dir - 1).rem_euclid(list.len() as i64) as usize
                 } else {
-                    list.len() - 1
+                    dir.rem_euclid(list.len() as i64) as usize
                 }
             }
         };
@@ -647,7 +719,7 @@ impl Ui {
 
     // MARK: - menus
 
-    fn open_menu(&mut self, _host: &dyn Host, addr: usize, anchor: R) {
+    fn open_menu(&mut self, host: &dyn Host, addr: usize, anchor: R) {
         let n = PARAMS[addr].item_count();
         let ih = 20.0;
         let h = (n as f32 * ih + 8.0).min(layout::H - 40.0);
@@ -656,8 +728,10 @@ impl Ui {
         if y + h > layout::H - 8.0 {
             y = (anchor.y - h - 4.0).max(8.0);
         }
-        let x = anchor.x.min(layout::W - wdt - 8.0);
-        self.menu = Some(Menu { addr, r: R::new(x, y, wdt, h), scroll: 0.0, hover: None });
+        let x = anchor.x.min(layout::W - wdt - 8.0).max(8.0);
+        let max_scroll = (n as f32 * ih + 8.0 - h).max(0.0);
+        let scroll = (index_of(host, addr) as f32 * ih - (h - 8.0) * 0.5).clamp(0.0, max_scroll);
+        self.menu = Some(Menu { addr, r: R::new(x, y, wdt, h), scroll, hover: None });
     }
 
     fn menu_click(&mut self, host: &dyn Host, x: f32, y: f32) {
@@ -698,7 +772,7 @@ impl Ui {
             self.draw_all(host, c);
         } else {
             let mut regions: Vec<R> = Vec::new();
-            let body_page = self.page != Page::Synth;
+            let body_page = true;
             let mut body_dirty = body_page && page != self.last.page;
             for (i, sig) in sigs.iter().enumerate() {
                 if *sig != self.last.sigs[i] {
@@ -811,44 +885,28 @@ impl Ui {
         h.0
     }
 
-    fn display_sig(&self, host: &dyn Host) -> u64 {
+    fn display_sig(&self, _host: &dyn Host) -> u64 {
         let mut h = Sig::new();
         h.str(&self.patch_name);
         h.str(&self.patch_bank);
         h.add(self.is_modified() as u64);
-        match display::focus(self) {
-            Some(addr) => {
-                h.add(addr as u64 + 1);
-                // the graph may depend on the whole group
-                let g = PARAMS[addr].group;
-                for (i, p) in PARAMS.iter().enumerate() {
-                    if p.group == g || addr == i {
-                        h.add(host.get(i).to_bits() as u64);
-                    }
-                }
-                if matches!(g, jovian_core::params::Group::Vcf | jovian_core::params::Group::Vco) {
-                    for a in [jovian_core::params::addr::LpfCut, jovian_core::params::addr::LpfRes, jovian_core::params::addr::LpfSlop, jovian_core::params::addr::HPF_Cutoff] {
-                        h.add(host.get(a).to_bits() as u64);
-                    }
-                }
-            }
-            None => {
-                let m = self.meters;
-                h.add(m.active_voices as u64);
-                h.add(m.gated_voices as u64);
-                h.add((m.lfo * 20.0) as i64 as u64);
-                h.add((m.env1 * 60.0) as i64 as u64);
-                h.add((m.env2 * 60.0) as i64 as u64);
-            }
-        }
+        let m = self.meters;
+        h.add(m.active_voices as u64);
+        h.add(m.gated_voices as u64);
+        h.add((m.lfo * 20.0) as i64 as u64);
+        h.add((m.env1 * 60.0) as i64 as u64);
+        h.add((m.env2 * 60.0) as i64 as u64);
         h.0
     }
 
     fn page_sig(&self, host: &dyn Host) -> u64 {
-        if self.page == Page::Synth {
-            return 0;
-        }
         let mut h = Sig::new();
+        h.add(self.page_state.mod_source as u64);
+        h.add(self.page_state.fx_selected as u64);
+        h.add(host.tempo_bpm().to_bits());
+        h.add((self.meters.env1 * 60.0) as i64 as u64);
+        h.add((self.meters.env2 * 60.0) as i64 as u64);
+        h.add((self.meters.lfo * 20.0) as i64 as u64);
         for i in 0..COUNT {
             h.add(host.get(i).to_bits() as u64);
         }
@@ -876,7 +934,7 @@ impl Ui {
                     Kind::Fader { .. } => ctl.r.inset_xy(-4.0, -2.0),
                     _ => ctl.r.inset(-1.0),
                 };
-                c.rrect(r, 3.0, Rgba::hex(0x1F1F22).with_alpha(0.62));
+                c.rrect(r, 3.0, t::PANEL_TOP.with_alpha(0.66));
             }
         }
     }
@@ -897,9 +955,9 @@ impl Ui {
             let wdt = c.fonts.measure(s, &st) + 28.0;
             let r = R::new((layout::W - wdt) * 0.5, layout::H - 44.0, wdt, 26.0);
             c.shadow(r, 13.0, 8.0, 3.0, Rgba::black(0.6));
-            c.rrect(r, 13.0, Rgba::hex(0x2E2E33));
+            c.rrect(r, 4.0, t::DISPLAY_BG);
             c.rrect_stroke(r, 13.0, 0.75, Rgba::white(0.12));
-            c.text_in(s, r, &st, t::INK, 0.5);
+            c.text_in(s, r, &st, t::DISPLAY_INK, 0.5);
         }
     }
 
@@ -908,13 +966,16 @@ impl Ui {
         // header
         let hr = R::new(0.0, 0.0, layout::W, layout::HEADER_H);
         c.rect(hr, vgrad(0.0, hr.h, t::HEADER_TOP, t::HEADER_BOTTOM));
-        c.hline(0.0, layout::W, layout::HEADER_H - 1.0, 1.0, Rgba::black(0.9));
-        c.hline(0.0, layout::W, layout::HEADER_H, 1.0, Rgba::white(0.05));
-        draw_logo(c, 20.0, 31.0);
+        c.hline(layout::MARGIN, layout::W - layout::MARGIN, layout::HEADER_H - 1.0, 1.0, t::LINE_STRONG);
+
+        draw_logo(c, 22.0, 40.0);
         display::draw_static(c, layout::display_rect());
         if let Some(k) = self.layout.controls.iter().find(|k| k.kind == Kind::Keyboard) {
             keyboard_static(c, k.r);
         }
+        // Instrument cards sit behind their control labels and slots.
+        pages::instrument::draw_background(self, c);
+        c.hline(layout::MARGIN, layout::W - layout::MARGIN, layout::BOTTOM_TOP - 7.0, 1.0, t::LINE_STRONG);
         // body
         for (p, d) in &self.layout.decos {
             if p.map_or(true, |p| p == self.page) {
@@ -923,7 +984,7 @@ impl Ui {
                 }
             }
         }
-        grain(c);
+
         for (p, d) in &self.layout.decos {
             if p.map_or(true, |p| p == self.page) {
                 if !matches!(d, Deco::Section { .. }) {
@@ -947,24 +1008,6 @@ impl Ui {
 
     pub fn is_dragging(&self) -> bool {
         self.drag.is_some()
-    }
-}
-
-/// A faint, fixed grain over the panels (like bead-blasted metal); drawn once into the cache.
-fn grain(c: &mut Canvas) {
-    let w = c.pix.width() as usize;
-    let data = c.pix.data_mut();
-    let mut seed = 0x2545_F491u32;
-    for (i, px) in data.chunks_exact_mut(4).enumerate() {
-        seed ^= seed << 13;
-        seed ^= seed >> 17;
-        seed ^= seed << 5;
-        // a little coarser than one device pixel, and slightly streaked horizontally
-        let row = (i / w) as u32;
-        let n = ((seed >> 24) as i32 - 128) / 64 + ((row.wrapping_mul(2_654_435_761) >> 30) as i32 - 2) / 2;
-        for ch in px.iter_mut().take(3) {
-            *ch = (*ch as i32 + n).clamp(0, 255) as u8;
-        }
     }
 }
 
@@ -1052,8 +1095,8 @@ fn menu_item_at(m: &Menu, x: f32, y: f32) -> Option<usize> {
 fn draw_menu(c: &mut Canvas, host: &dyn Host, m: &Menu) {
     let r = m.r;
     c.shadow(r, 6.0, 14.0, 6.0, Rgba::black(0.7));
-    c.rrect(r, 6.0, Rgba::hex(0x2A2A2F));
-    c.rrect_stroke(r, 6.0, 0.75, Rgba::white(0.14));
+    c.rrect(r, 3.0, t::PANEL_TOP);
+    c.rrect_stroke(r, 3.0, 1.0, t::LINE_STRONG);
     let cur = index_of(host, m.addr);
     c.set_clip(r.inset(2.0));
     for (i, s) in PARAMS[m.addr].items().iter().enumerate() {
@@ -1062,9 +1105,9 @@ fn draw_menu(c: &mut Canvas, host: &dyn Host, m: &Menu) {
             continue;
         }
         if m.hover == Some(i) {
-            c.rrect(ir, 4.0, t::ORANGE.with_alpha(0.9));
+            c.rrect(ir, 2.0, t::WELL);
         }
-        let ink = if m.hover == Some(i) { t::INK_DARK } else if i == cur { t::AMBER } else { t::INK };
+        let ink = if m.hover == Some(i) { t::INK_DARK } else if i == cur { t::VALUE_INK } else { t::INK };
         if i == cur {
             c.circle(ir.x + 8.0, ir.cy(), 2.5, ink);
         }
@@ -1074,14 +1117,9 @@ fn draw_menu(c: &mut Canvas, host: &dyn Host, m: &Menu) {
 }
 
 fn draw_logo(c: &mut Canvas, x: f32, base: f32) {
-    let st = Style::new(Face::Bold, 21.0, 4.2);
-    let wdt = c.text("JOVIAN", x, base, &st, t::INK, 0.0);
-    // the dash between name and number in the Jupiter colours
-    w::rainbow(c, x + wdt + 5.0, base - 9.5, 22.0, 4.0);
-    let st8 = Style::new(Face::Bold, 21.0, 0.0);
-    c.text("8", x + wdt + 32.0, base, &st8, t::INK, 0.0);
-    let sub = Style::new(Face::CondSemi, 8.5, 2.2);
-    c.text("POLYPHONIC SYNTHESIZER", x + 1.0, base + 12.0, &sub, t::INK_DIM, 0.0);
+    let width = c.text("jovian", x, base, &Style::new(Face::Bold, 29.0, -0.6), t::INK, 0.0);
+    c.text("8", x + width + 6.0, base, &Style::new(Face::MonoSemi, 27.0, -1.0), t::ORANGE, 0.0);
+    c.text("POLYPHONIC INSTRUMENT", x + 1.0, base + 15.0, &Style::new(Face::Medium, 7.5, 1.1), t::INK_DIM, 0.0);
 }
 
 fn draw_deco(c: &mut Canvas, d: &Deco) {
@@ -1146,7 +1184,7 @@ fn draw_control(ui: &Ui, host: &dyn Host, c: &mut Canvas, ctl: &Control, hover: 
     match &ctl.kind {
         Kind::Fader { addr, label, color, origin } => {
             let v = host.get(*addr);
-            let val = PARAMS[*addr].display_string(v as f64);
+            let val = display::parameter_value(*addr, v);
             w::fader(c, r, v, *color, *origin, label, Some(&val), hover, active);
         }
         Kind::Switch { addr, items, order, color, vertical } => {
@@ -1165,16 +1203,15 @@ fn draw_control(ui: &Ui, host: &dyn Host, c: &mut Canvas, ctl: &Control, hover: 
         }
         Kind::Knob { addr, label, color, bipolar, radius } => {
             let v = host.get(*addr);
-            let cy = r.y + radius + 6.0;
+            let cy = r.y + radius + 4.0;
             w::knob_static(c, r.cx(), cy, *radius);
             w::knob(c, r.cx(), cy, *radius, v, *color, *bipolar, hover, active);
-            let ly = cy + radius + 18.0;
-            if hover || active {
-                let val = PARAMS[*addr].display_string(v as f64);
-                c.text(&val, r.cx(), ly, &t::VALUE, t::AMBER, 0.5);
-            } else {
-                c.text(label, r.cx(), ly, &t::LABEL, t::INK.with_alpha(0.86), 0.5);
-            }
+            let ly = cy + radius + 14.0;
+            c.text(label, r.cx(), ly, &t::LABEL, t::INK.with_alpha(0.86), 0.5);
+            let val = display::parameter_value(*addr, v);
+            c.set_clip(R::new(r.x - 6.0, ly + 2.0, r.w + 12.0, 16.0));
+            c.text(&val, r.cx(), ly + 13.0, &t::VALUE, if hover || active { t::BLUE } else { t::INK_DIM }, 0.5);
+            c.clear_clip();
         }
         Kind::Stepper { addr } => {
             let v = host.get(*addr);
@@ -1186,7 +1223,7 @@ fn draw_control(ui: &Ui, host: &dyn Host, c: &mut Canvas, ctl: &Control, hover: 
         }
         Kind::Tab(p) => w::tab(c, r, p.title(), ui.page == *p, hover),
         Kind::PatchPrev | Kind::PatchNext => {
-            let col = if hover { t::INK } else { t::INK_DIM };
+            let col = if hover { t::DISPLAY_INK } else { t::DISPLAY_DIM };
             let dir = if ctl.kind == Kind::PatchPrev { -1.0 } else { 1.0 };
             if hover {
                 c.rrect(r, 4.0, Rgba::white(0.06));
@@ -1225,33 +1262,15 @@ mod layout_addr {
 }
 
 fn draw_wheel(c: &mut Canvas, r: R, v: f32, center: bool, hover: bool, label: &str) {
-    // slot
-    c.rrect(r.inset(-2.0), 6.0, Rgba::black(0.6));
-    c.rrect(r, 5.0, vgrad(r.y, r.bottom(), Rgba::hex(0x0A0A0B), Rgba::hex(0x151517)));
-    // wheel surface with ribs, shifted with the value
-    let inner = r.inset(2.5);
-    c.set_clip(inner);
-    c.rrect(inner, 4.0, Fill::Linear(inner.x, 0.0, inner.right(), 0.0, vec![(0.0, Rgba::hex(0x1C1C1F)), (0.5, Rgba::hex(0x3A3A40)), (1.0, Rgba::hex(0x1C1C1F))]));
-    let travel = inner.h - 14.0;
-    let pos = inner.bottom() - 7.0 - v * travel;
-    let off = (v * 60.0) % 6.0;
-    let mut y = inner.y - 6.0 + off;
-    while y < inner.bottom() + 6.0 {
-        let d = ((y - inner.cy()) / (inner.h * 0.5)).abs().min(1.0);
-        c.hline(inner.x + 1.0, inner.right() - 1.0, y, 1.0, Rgba::black(0.35 + 0.3 * d));
-        y += 6.0;
+    c.rrect(r, 3.0, t::DISPLAY_BG);
+    for i in 1..12 {
+        let y = r.y + r.h * i as f32 / 12.0;
+        c.hline(r.x + 4.0, r.right() - 4.0, y, 1.0, t::DISPLAY_LINE);
     }
-    // shading: top and bottom fall off into darkness (cylinder)
-    c.rect(inner, vgrad(inner.y, inner.bottom(), Rgba::black(0.55), Rgba::black(0.0)));
-    c.rect(R::new(inner.x, inner.cy(), inner.w, inner.h * 0.5), vgrad(inner.cy(), inner.bottom(), Rgba::black(0.0), Rgba::black(0.6)));
-    // marker
-    let mk = R::new(inner.x, pos - 2.0, inner.w, 4.0);
-    c.rect(mk, if hover { t::ORANGE.lighten(0.15) } else { t::ORANGE });
-    c.clear_clip();
-    if center {
-        c.hline(r.x - 5.0, r.x - 1.0, r.cy(), 1.0, Rgba::white(0.35));
-    }
-    c.text(label, r.cx(), r.bottom() + 13.0, &Style::new(Face::CondSemi, 8.5, 0.6), t::INK_DIM, 0.5);
+    let y = r.bottom() - 8.0 - v * (r.h - 16.0);
+    c.rrect(R::new(r.x + 3.0, y - 2.0, r.w - 6.0, 4.0), 1.0, if hover { t::AMBER } else { t::ORANGE });
+    if center { c.hline(r.x - 4.0, r.x - 1.0, r.cy(), 1.0, t::INK_DIM); }
+    c.text(label, r.cx(), r.bottom() + 13.0, &Style::new(Face::Medium, 8.0, 0.2), t::INK_DIM, 0.5);
 }
 
 /// Key rectangles as drawn: (note, rect, is_black).
@@ -1268,38 +1287,25 @@ pub fn keybed(r: R) -> R {
 }
 
 fn white_key(c: &mut Canvas, n: u8, kr: R, down: bool) {
-    let (a, b) = if down { (Rgba::hex(0xD9D6CD), Rgba::hex(0xC9C5BA)) } else { (Rgba::hex(0xF4F2EC), Rgba::hex(0xDCD9D0)) };
-    c.rrect(kr, 3.0, vgrad(kr.y, kr.bottom(), a, b));
-    c.rrect_stroke(kr, 3.0, 0.75, Rgba::black(0.45));
-    if down {
-        c.rrect(R::new(kr.x + 2.0, kr.bottom() - 10.0, kr.w - 4.0, 6.0), 2.0, t::ORANGE.with_alpha(0.85));
-    }
+    c.rrect(kr, 2.0, if down { t::WHITE_KEY } else { t::PANEL_TOP });
+    c.rrect_stroke(kr, 2.0, 0.75, t::LINE);
+    if down { c.rrect(R::new(kr.x + 3.0, kr.bottom() - 7.0, kr.w - 6.0, 3.0), 1.0, t::ORANGE); }
     if n % 12 == 0 {
-        let st = Style::new(Face::CondSemi, 8.0, 0.4);
-        c.text(&format!("C{}", n as i32 / 12 - 1), kr.cx(), kr.bottom() - 6.0, &st, Rgba::black(0.45), 0.5);
+        c.text(&format!("C{}", n as i32 / 12 - 1), kr.cx(), kr.bottom() - 9.0, &Style::new(Face::Mono, 8.0, 0.0), t::INK_DIM, 0.5);
     }
 }
 
 fn black_key(c: &mut Canvas, kr: R, down: bool) {
-    c.shadow(kr, 2.5, 3.0, 2.0, Rgba::black(0.6));
-    let (a, b) = if down { (Rgba::hex(0x2A2A2E), Rgba::hex(0x1A1A1D)) } else { (Rgba::hex(0x35353A), Rgba::hex(0x0E0E10)) };
-    c.rrect(kr, 2.5, vgrad(kr.y, kr.bottom(), a, b));
-    c.rrect(R::new(kr.x + 2.0, kr.bottom() - 7.0, kr.w - 4.0, 4.0), 1.5, if down { t::ORANGE } else { Rgba::white(0.08) });
+    c.rrect(kr, 2.0, if down { t::BLUE } else { t::INK });
+    c.hline(kr.x + 3.0, kr.right() - 3.0, kr.bottom() - 6.0, 1.0, if down { t::AMBER } else { t::DISPLAY_DIM.with_alpha(0.3) });
 }
 
 fn keyboard_static(c: &mut Canvas, r: R) {
-    c.rrect(r, 6.0, vgrad(r.y, r.bottom(), Rgba::hex(0x1F1F22), Rgba::hex(0x151517)));
-    c.rrect_stroke(r, 6.0, 1.0, Rgba::black(0.7));
-    let felt = R::new(r.x + 10.0, r.y + 8.0, r.w - 20.0, 3.0);
-    c.rect(felt, Rgba::hex(0x7A1E17));
+    c.rrect(r, 3.0, t::WELL);
+    c.rrect_stroke(r, 3.0, 1.0, t::LINE);
     let keys = drawn_keys(r);
-    for (n, kr, _) in keys.iter().filter(|k| !k.2) {
-        white_key(c, *n, *kr, false);
-    }
-    for (_, kr, _) in keys.iter().filter(|k| k.2) {
-        black_key(c, *kr, false);
-    }
-    c.rect(R::new(r.x + 10.0, r.y + 11.0, r.w - 20.0, 6.0), vgrad(r.y + 11.0, r.y + 17.0, Rgba::black(0.45), Rgba::black(0.0)));
+    for (n, kr, _) in keys.iter().filter(|k| !k.2) { white_key(c, *n, *kr, false); }
+    for (_, kr, _) in keys.iter().filter(|k| k.2) { black_key(c, *kr, false); }
 }
 
 fn draw_keyboard(ui: &Ui, c: &mut Canvas, r: R) {
@@ -1314,6 +1320,6 @@ fn draw_keyboard(ui: &Ui, c: &mut Canvas, r: R) {
         for (_, br, _) in keys.iter().filter(|k| k.2 && k.1.intersects(&kr)) {
             black_key(c, *br, false);
         }
-        c.rect(R::new(kr.x, r.y + 11.0, kr.w, 6.0), vgrad(r.y + 11.0, r.y + 17.0, Rgba::black(0.45), Rgba::black(0.0)));
+
     }
 }

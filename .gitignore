@@ -13,3 +13,9 @@ target/
 build/
 Tools/auhost/auhost
 Tools/aurender/aurender
+
+/work/
+
+/artifacts/
+
+**/__pycache__/

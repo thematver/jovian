@@ -1,7 +1,7 @@
 //! The preset library: sources and categories, a searchable list, and the current patch card
 //! with save / import.
 
-use crate::canvas::{vgrad, Canvas, PathBuilder, Rgba, R};
+use crate::canvas::{Canvas, PathBuilder, Rgba, R};
 use crate::host::Host;
 use crate::layout::{Kind, Layout, Page, BODY};
 use crate::text::{Face, Style};
@@ -24,27 +24,31 @@ pub const REVEAL: u32 = 107;
 pub const RESCAN: u32 = 108;
 pub const SCROLLBAR: u32 = 109;
 
-const ROW_H: f32 = 26.0;
-const SIDE_W: f32 = 210.0;
-const CARD_W: f32 = 300.0;
+const ROW_H: f32 = 38.0;
+const SIDE_W: f32 = 196.0;
+const CARD_W: f32 = 216.0;
 
 fn side_rect() -> R {
     R::new(BODY.x, BODY.y, SIDE_W, BODY.h)
 }
 fn list_panel() -> R {
-    R::new(BODY.x + SIDE_W + 8.0, BODY.y, BODY.w - SIDE_W - CARD_W - 16.0, BODY.h)
+    R::new(BODY.x + SIDE_W + 10.0, BODY.y, BODY.w - SIDE_W - CARD_W - 20.0, BODY.h)
 }
 fn search_rect() -> R {
     let p = list_panel();
-    R::new(p.x + 14.0, p.y + 12.0, p.w - 28.0 - 92.0, 28.0)
+    R::new(p.x + 14.0, p.y + 16.0, p.w - 28.0 - 100.0, 42.0)
 }
 fn rescan_rect() -> R {
     let s = search_rect();
-    R::new(s.right() + 8.0, s.y, 84.0, 28.0)
+    R::new(s.right() + 10.0, s.y, 90.0, 42.0)
+}
+fn current_rect() -> R {
+    let p = list_panel();
+    R::new(p.x + 14.0, p.y + 74.0, p.w - 28.0, 44.0)
 }
 fn list_rect() -> R {
     let p = list_panel();
-    R::new(p.x + 6.0, p.y + 76.0, p.w - 12.0, p.h - 82.0)
+    R::new(p.x + 6.0, p.y + 154.0, p.w - 12.0, p.h - 160.0)
 }
 fn card_rect() -> R {
     R::new(BODY.right() - CARD_W, BODY.y, CARD_W, BODY.h)
@@ -118,7 +122,7 @@ pub struct Library {
     pub name_field: TextField,
     pub bank_field: TextField,
     favorites: Option<BTreeSet<String>>,
-    drag_scroll: Option<(f32, f32)>,
+    pub(crate) drag_scroll: Option<(f32, f32)>,
 }
 
 fn favorites_path() -> std::path::PathBuf {
@@ -127,6 +131,8 @@ fn favorites_path() -> std::path::PathBuf {
 
 impl Library {
     pub fn ensure_scanned(&mut self) {
+        // Favorites must be available before the first list render or source filter.
+        self.favorites();
         if self.scanned || self.scanning.is_some() {
             return;
         }
@@ -197,8 +203,14 @@ impl Library {
     }
 
     fn favorites(&mut self) -> &mut BTreeSet<String> {
+        self.favorites_from(&favorites_path())
+    }
+
+    fn favorites_from(&mut self, path: &std::path::Path) -> &mut BTreeSet<String> {
         self.favorites.get_or_insert_with(|| {
-            std::fs::read_to_string(favorites_path()).map(|s| s.lines().map(|l| l.to_string()).collect()).unwrap_or_default()
+            std::fs::read_to_string(path)
+                .map(|s| s.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect())
+                .unwrap_or_default()
         })
     }
 
@@ -327,19 +339,19 @@ fn side_row_rect(i: usize) -> R {
 
 fn name_rect() -> R {
     let c = card_rect();
-    R::new(c.x + 16.0, c.y + 64.0, c.w - 32.0, 30.0)
+    R::new(c.x + 16.0, c.y + 84.0, c.w - 32.0, 34.0)
 }
 fn bank_rect() -> R {
     let c = card_rect();
-    R::new(c.x + 16.0, c.y + 122.0, c.w - 32.0, 26.0)
+    R::new(c.x + 16.0, c.y + 150.0, c.w - 32.0, 30.0)
 }
 fn save_rect() -> R {
     let c = card_rect();
-    R::new(c.x + 16.0, c.bottom() - 112.0, c.w - 32.0, 30.0)
+    R::new(c.x + 16.0, c.y + 198.0, c.w - 32.0, 34.0)
 }
 fn import_rect() -> R {
     let c = card_rect();
-    R::new(c.x + 16.0, c.bottom() - 74.0, (c.w - 40.0) * 0.5, 28.0)
+    R::new(c.x + 16.0, c.bottom() - 46.0, (c.w - 40.0) * 0.5, 30.0)
 }
 fn reveal_rect() -> R {
     let c = card_rect();
@@ -386,8 +398,14 @@ fn reveal(ui: &mut Ui) {
 }
 
 fn commit_fields(ui: &mut Ui, host: &dyn Host) {
-    let name = ui.library.name_field.text.trim().to_string();
-    let bank = ui.library.bank_field.text.trim().to_string();
+    // Only the focused field has a current draft. Read the other value from the host:
+    // UI metadata can still belong to the preceding frame or the preceding patch.
+    let (mut name, mut bank, _) = host.patch_info();
+    match ui.library.focus {
+        Some(NAME) => name = ui.library.name_field.text.trim().to_string(),
+        Some(BANK) => bank = ui.library.bank_field.text.trim().to_string(),
+        _ => return,
+    }
     if !name.is_empty() {
         host.rename(&name, if bank.is_empty() { "User" } else { &bank });
     }
@@ -395,6 +413,9 @@ fn commit_fields(ui: &mut Ui, host: &dyn Host) {
 
 fn focus(ui: &mut Ui, id: Option<u32>) {
     let lib = &mut ui.library;
+    if lib.focus == id {
+        return;
+    }
     match id {
         Some(NAME) => lib.name_field.set(&ui.patch_name),
         Some(BANK) => lib.bank_field.set(&ui.patch_bank),
@@ -667,7 +688,8 @@ pub fn import_path(ui: &mut Ui, host: &dyn Host, path: &std::path::Path) {
     match jovian_core::preset::jup4x::read(&data) {
         Ok(v) if !v.is_empty() => {
             host.load_patch(&jovian_core::preset::PatchState::from_preset(&v[0]));
-            let _ = library::import_file(path);
+            ui.library.current = library::import_file(path).ok().map(|p| format!("{}#0", p.display()));
+            ui.library.reveal_current = true;
             ui.library.rescan();
             ui.set_status(if v.len() > 1 {
                 format!("Loaded {}; {} presets added to My Presets", v[0].name, v.len())
@@ -683,10 +705,8 @@ pub fn import_path(ui: &mut Ui, host: &dyn Host, path: &std::path::Path) {
 // MARK: - drawing
 
 fn panel(c: &mut Canvas, r: R) {
-    c.shadow(r, 6.0, 6.0, 3.0, Rgba::black(0.45));
-    c.rrect(r, 6.0, vgrad(r.y, r.bottom(), Rgba::hex(0x232327), Rgba::hex(0x1C1C1F)));
-    c.rrect_stroke(r, 6.0, 1.0, Rgba::black(0.65));
-    c.rrect_stroke(r.inset(1.0), 5.0, 1.0, Rgba::white(0.045));
+    c.rrect(r, 5.0, t::PANEL_TOP);
+    c.rrect_stroke(r, 5.0, 1.0, t::LINE);
 }
 
 pub fn draw_background(ui: &Ui, c: &mut Canvas) {
@@ -695,40 +715,59 @@ pub fn draw_background(ui: &Ui, c: &mut Canvas) {
     }
     panel(c, side_rect());
     panel(c, list_panel());
-    panel(c, card_rect());
+    let cr = card_rect();
+    panel(c, R::new(cr.x, cr.y, cr.w, 248.0));
+    panel(c, R::new(cr.x, cr.y + 258.0, cr.w, cr.h - 258.0));
     // list header
     let lr = list_rect();
     let hy = lr.y - 14.0;
     let st = Style::new(Face::CondSemi, 9.0, 1.2);
-    c.text("NAME", lr.x + 34.0, hy, &st, t::INK_DIM, 0.0);
-    c.text("TYPE", lr.x + lr.w * 0.56, hy, &st, t::INK_DIM, 0.0);
-    c.text("BANK", lr.x + lr.w * 0.74, hy, &st, t::INK_DIM, 0.0);
-    c.hline(lr.x + 4.0, lr.right() - 4.0, lr.y - 4.0, 1.0, Rgba::white(0.08));
+    c.text("PRESET / BANK", lr.x + 34.0, hy, &st, t::INK_DIM, 0.0);
+    c.text("TYPE", lr.x + lr.w * 0.74, hy, &st, t::INK_DIM, 0.0);
+    c.hline(lr.x + 4.0, lr.right() - 4.0, lr.y - 4.0, 1.0, t::LINE);
     // card captions
-    let cr = card_rect();
-    c.text("CURRENT PATCH", cr.x + 16.0, cr.y + 26.0, &t::TITLE, t::INK, 0.0);
-    c.text("NAME", cr.x + 16.0, cr.y + 56.0, &t::SMALL, t::INK_DIM, 0.0);
-    c.text("BANK", cr.x + 16.0, cr.y + 114.0, &t::SMALL, t::INK_DIM, 0.0);
-    c.text("NOTES", cr.x + 16.0, cr.y + 172.0, &t::SMALL, t::INK_DIM, 0.0);
+    c.text("KEEP THIS SOUND", cr.x + 16.0, cr.y + 29.0, &t::TITLE, t::INK, 0.0);
+    c.text("Name and save your current edit", cr.x + 16.0, cr.y + 49.0,
+        &Style::new(Face::Regular, 10.0, 0.0), t::INK_DIM, 0.0);
+    c.text("NAME", cr.x + 16.0, cr.y + 74.0, &t::SMALL, t::INK_DIM, 0.0);
+    c.text("BANK", cr.x + 16.0, cr.y + 140.0, &t::SMALL, t::INK_DIM, 0.0);
+    c.text("ABOUT THIS PATCH", cr.x + 16.0, cr.y + 284.0, &t::TITLE, t::INK, 0.0);
 }
 
 fn field(c: &mut Canvas, r: R, text: &str, placeholder: &str, focused: bool, caret: Option<usize>, big: bool) {
-    c.rrect(r, 4.0, vgrad(r.y, r.bottom(), Rgba::hex(0x0B0B0C), Rgba::hex(0x121214)));
-    c.rrect_stroke(r, 4.0, if focused { 1.5 } else { 0.75 }, if focused { t::ORANGE } else { Rgba::white(0.12) });
+    c.rrect(r, 4.0, t::WELL);
+    c.rrect_stroke(r, 4.0, if focused { 1.5 } else { 0.75 }, if focused { t::ORANGE } else { t::LINE });
     let st = if big { Style::new(Face::Semi, 14.0, 0.1) } else { t::UI };
     let tr = r.inset_xy(10.0, 0.0);
+    let caret_width = caret.map(|ci| c.fonts.measure(&text.chars().take(ci).collect::<String>(), &st)).unwrap_or(0.0);
+    let scroll = if focused { (caret_width - tr.w + 3.0).max(0.0) } else { 0.0 };
     c.set_clip(r.inset(2.0));
     if text.is_empty() && !focused {
         c.text_in(placeholder, tr, &st, t::INK_FAINT, 0.0);
     } else {
-        c.text_in(text, tr, &st, t::INK, 0.0);
+        let shown = if focused { text.to_owned() } else { fit_text(c.fonts, text, &st, tr.w) };
+        c.text_in(&shown, tr.offset(-scroll, 0.0), &st, t::INK, 0.0);
     }
-    if let (true, Some(ci)) = (focused, caret) {
-        let pre: String = text.chars().take(ci).collect();
-        let x = tr.x + c.fonts.measure(&pre, &st) + 0.5;
+    if focused && caret.is_some() {
+        let x = tr.x + caret_width - scroll + 0.5;
         c.rect(R::new(x, r.cy() - 8.0, 1.5, 16.0), t::ORANGE);
     }
     c.clear_clip();
+}
+
+/// Keep long preset names and banks inside their own columns.
+fn fit_text(fonts: &crate::text::Fonts, text: &str, style: &Style, width: f32) -> String {
+    if fonts.measure(text, style) <= width {
+        return text.to_owned();
+    }
+    let mut shown = text.to_owned();
+    let ellipsis = "…";
+    let room = (width - fonts.measure(ellipsis, style)).max(0.0);
+    while !shown.is_empty() && fonts.measure(&shown, style) > room {
+        shown.pop();
+    }
+    shown.push_str(ellipsis);
+    shown
 }
 
 fn star(c: &mut Canvas, cx: f32, cy: f32, r: f32, on: bool, hover: bool) {
@@ -746,9 +785,9 @@ fn star(c: &mut Canvas, cx: f32, cy: f32, r: f32, on: bool, hover: bool) {
     pb.close();
     if let Some(p) = pb.finish() {
         if on {
-            c.fill_path(&p, t::AMBER);
+            c.fill_path(&p, t::ORANGE);
         } else {
-            c.stroke_path(&p, 1.0, if hover { t::INK_DIM } else { Rgba::white(0.16) });
+            c.stroke_path(&p, 1.0, if hover { t::INK_DIM } else { t::LINE_STRONG });
         }
     }
 }
@@ -782,16 +821,16 @@ pub fn draw(ui: &Ui, host: &dyn Host, c: &mut Canvas) {
         let on = lib.category.as_ref() == Some(&cat);
         let hover = r.contains(ui.mouse.0, ui.mouse.1);
         if on {
-            c.rrect(r, 11.0, t::ORANGE);
+            c.rrect(r, 4.0, t::ORANGE);
         } else {
-            c.rrect(r, 11.0, Rgba::white(if hover { 0.1 } else { 0.055 }));
+            c.rrect(r, 4.0, t::INK.with_alpha(if hover { 0.09 } else { 0.045 }));
         }
         let _ = n;
-        c.text_in(&cat, r, &chip_style(), if on { t::INK_DARK } else { t::INK.with_alpha(0.82) }, 0.5);
+        c.text_in(&cat, r, &chip_style(), if on { t::DISPLAY_INK } else { t::INK.with_alpha(0.82) }, 0.5);
     }
     // search
     let sr = search_rect();
-    field(c, sr, &lib.search_field.text, "Search presets", lib.focus == Some(SEARCH), Some(lib.search_field.caret), false);
+    field(c, sr, &lib.search_field.text, "Search presets, banks or sound types", lib.focus == Some(SEARCH), Some(lib.search_field.caret), true);
     // magnifier
     if lib.focus != Some(SEARCH) && lib.search_field.text.is_empty() {
         let (mx, my) = (sr.right() - 16.0, sr.cy() - 1.0);
@@ -802,6 +841,20 @@ pub fn draw(ui: &Ui, host: &dyn Host, c: &mut Canvas) {
     let hover_rescan = rr.contains(ui.mouse.0, ui.mouse.1);
     w::text_button(c, rr, if lib.is_scanning() { "Scanning…" } else { "Rescan" }, hover_rescan, false);
 
+    let current = current_rect();
+    c.rrect(current, 4.0, t::DISPLAY_BG);
+    c.text("CURRENT", current.x + 12.0, current.y + 12.0,
+        &Style::new(Face::Mono, 8.5, 0.7), t::DISPLAY_DIM, 0.0);
+    let current_st = Style::new(Face::Semi, 15.0, 0.0);
+    let current_name = fit_text(c.fonts, &ui.patch_name, &current_st, current.w * 0.55);
+    c.text(&current_name, current.x + 12.0, current.y + 33.0, &current_st, t::DISPLAY_INK, 0.0);
+    let modified = ui.is_modified();
+    c.text(if modified { "EDITED · SAVE TO KEEP" } else { "LOADED PATCH" }, current.right() - 12.0, current.y + 14.0,
+        &Style::new(Face::Mono, 9.0, 0.0), if modified { t::AMBER } else { t::DISPLAY_DIM }, 1.0);
+    let bank_st = Style::new(Face::Medium, 11.0, 0.0);
+    c.text(&fit_text(c.fonts, &ui.patch_bank, &bank_st, current.w * 0.35), current.right() - 12.0, current.y + 33.0,
+        &bank_st, t::DISPLAY_DIM, 1.0);
+
     // list
     let lr = list_rect();
     let (list, max) = list_metrics(ui);
@@ -809,8 +862,8 @@ pub fn draw(ui: &Ui, host: &dyn Host, c: &mut Canvas) {
     let first = (lib.scroll / ROW_H).floor().max(0.0) as usize;
     let visible = (lr.h / ROW_H).ceil() as usize + 1;
     let cur = lib.current.as_deref();
-    let name_st = Style::new(Face::Medium, 12.0, 0.0);
-    let meta_st = Style::new(Face::Regular, 11.0, 0.0);
+    let name_st = Style::new(Face::Medium, 13.5, 0.0);
+    let meta_st = Style::new(Face::Regular, 10.5, 0.0);
     for i in first..(first + visible).min(list.len()) {
         let e = &list[i];
         let y = lr.y + 4.0 + i as f32 * ROW_H - lib.scroll;
@@ -824,15 +877,19 @@ pub fn draw(ui: &Ui, host: &dyn Host, c: &mut Canvas) {
             c.rrect(row, 4.0, t::ORANGE.with_alpha(0.16));
             c.rrect(R::new(row.x, row.y + 4.0, 3.0, row.h - 8.0), 1.5, t::ORANGE);
         } else if hover {
-            c.rrect(row, 4.0, Rgba::white(0.05));
+            c.rrect(row, 4.0, t::INK.with_alpha(0.05));
         } else if i % 2 == 1 {
-            c.rrect(row, 4.0, Rgba::white(0.015));
+            c.rrect(row, 4.0, t::INK.with_alpha(0.018));
         }
         star(c, row.x + 15.0, row.cy(), 5.5, lib.is_favorite(e), hover);
         let ink = if is_cur { t::INK } else { t::INK.with_alpha(0.9) };
-        c.text_in(&e.name, R::new(row.x + 30.0, row.y, row.w * 0.5, row.h), &name_st, ink, 0.0);
-        c.text_in(&e.category, R::new(lr.x + lr.w * 0.56, row.y, lr.w * 0.17, row.h), &meta_st, t::INK_DIM, 0.0);
-        c.text_in(&e.bank, R::new(lr.x + lr.w * 0.74, row.y, lr.w * 0.24, row.h), &meta_st, t::INK_DIM, 0.0);
+        let name_r = R::new(row.x + 30.0, row.y + 1.0, lr.w * 0.72 - 46.0, 19.0);
+        let type_r = R::new(lr.x + lr.w * 0.74, row.y, lr.w * 0.24 - 16.0, row.h);
+        let bank_r = R::new(name_r.x, row.y + 19.0, name_r.w, 15.0);
+        c.text_in(&fit_text(c.fonts, &e.name, &name_st, name_r.w), name_r, &name_st, ink, 0.0);
+        c.text_in(&fit_text(c.fonts, &e.category, &meta_st, type_r.w), type_r, &meta_st, t::INK_DIM, 0.0);
+        let bank = if e.bank == e.source.title() { e.bank.clone() } else { format!("{} · {}", e.bank, e.source.title()) };
+        c.text_in(&fit_text(c.fonts, &bank, &meta_st, bank_r.w), bank_r, &meta_st, t::INK_DIM, 0.0);
     }
     c.clear_clip();
     if list.is_empty() {
@@ -844,13 +901,10 @@ pub fn draw(ui: &Ui, host: &dyn Host, c: &mut Canvas) {
         let content = list.len() as f32 * ROW_H;
         let th = (lr.h * lr.h / content).max(24.0);
         let ty = lr.y + (lr.h - th) * (lib.scroll / max);
-        c.rrect(R::new(lr.right() - 8.0, ty, 4.0, th), 2.0, Rgba::white(if lib.drag_scroll.is_some() { 0.4 } else { 0.18 }));
+        c.rrect(R::new(lr.right() - 8.0, ty, 4.0, th), 2.0, t::INK.with_alpha(if lib.drag_scroll.is_some() { 0.5 } else { 0.24 }));
     }
     let count = format!("{} presets", list.len());
-    c.text(&count, list_panel().right() - 14.0, list_panel().y + 61.0, &t::SMALL, t::INK_FAINT, 1.0);
-    if let Some(cat) = &lib.category {
-        c.text(&cat.to_uppercase(), lr.x + 6.0, list_panel().y + 61.0, &Style::new(Face::CondBold, 9.5, 1.2), t::ORANGE, 0.0);
-    }
+    c.text(&count, list_panel().right() - 14.0, list_rect().y - 14.0, &t::SMALL, t::INK_FAINT, 1.0);
 
     // card
     let name = if lib.focus == Some(NAME) { lib.name_field.text.clone() } else { ui.patch_name.clone() };
@@ -858,27 +912,20 @@ pub fn draw(ui: &Ui, host: &dyn Host, c: &mut Canvas) {
     field(c, name_rect(), &name, "Name", lib.focus == Some(NAME), Some(lib.name_field.caret), true);
     field(c, bank_rect(), &bank, "Bank", lib.focus == Some(BANK), Some(lib.bank_field.caret), false);
     let cr = card_rect();
-    let notes = R::new(cr.x + 16.0, cr.y + 180.0, cr.w - 32.0, save_rect().y - cr.y - 196.0);
+    let notes = R::new(cr.x + 16.0, cr.y + 300.0, cr.w - 32.0, import_rect().y - cr.y - 312.0);
     notes_block(c, host, notes);
     let m = ui.mouse;
     w::text_button(c, save_rect(), "Save to My Presets", save_rect().contains(m.0, m.1), true);
     w::text_button(c, import_rect(), "Import…", import_rect().contains(m.0, m.1), false);
     w::text_button(c, reveal_rect(), "Show Folder", reveal_rect().contains(m.0, m.1), false);
-    c.text_in(
-        "Saved files are .jup4x: Jup-8 V imports them as is.",
-        R::new(cr.x + 16.0, cr.bottom() - 36.0, cr.w - 32.0, 20.0),
-        &Style::new(Face::Regular, 10.0, 0.0),
-        t::INK_FAINT,
-        0.0,
-    );
 }
 
 fn side_item(c: &mut Canvas, r: R, label: &str, n: usize, on: bool, hover: bool) {
     if on {
-        c.rrect(r, 4.0, Rgba::white(0.08));
+        c.rrect(r, 4.0, t::INK.with_alpha(0.07));
         c.rrect(R::new(r.x, r.y + 5.0, 2.5, r.h - 10.0), 1.0, t::ORANGE);
     } else if hover {
-        c.rrect(r, 4.0, Rgba::white(0.04));
+        c.rrect(r, 4.0, t::INK.with_alpha(0.04));
     }
     let st = Style::new(Face::Medium, 11.5, 0.0);
     c.text_in(label, r.inset_xy(12.0, 0.0), &st, if on { t::INK } else { t::INK.with_alpha(0.78) }, 0.0);
@@ -891,6 +938,11 @@ fn notes_block(c: &mut Canvas, host: &dyn Host, r: R) {
     let p = host.current_patch();
     let mut y = r.y + 14.0;
     let st = Style::new(Face::Regular, 11.5, 0.0);
+    if p.author.is_empty() && p.comment.is_empty() && !p.meta.contains_key("Characteristics") {
+        wrap(c, "Click a preset to audition it. Use ↑ and ↓ to keep listening, or type to search. Star the sounds you want to find again.",
+            r.x, y, r.w, r.bottom(), &st, t::INK_DIM);
+        return;
+    }
     if !p.author.is_empty() {
         c.text(&format!("by {}", p.author), r.x, y, &st, t::INK_DIM, 0.0);
         y += 20.0;
@@ -901,14 +953,15 @@ fn notes_block(c: &mut Canvas, host: &dyn Host, r: R) {
         let mut x = r.x;
         let tst = Style::new(Face::CondSemi, 10.0, 0.4);
         for tag in tags.iter().take(10) {
-            let wdt = c.fonts.measure(tag, &tst) + 14.0;
+            let shown = fit_text(c.fonts, tag, &tst, r.w - 14.0);
+            let wdt = c.fonts.measure(&shown, &tst) + 14.0;
             if x + wdt > r.right() {
                 x = r.x;
                 y += 24.0;
             }
             let tr = R::new(x, y - 13.0, wdt, 19.0);
-            c.rrect(tr, 9.5, Rgba::white(0.06));
-            c.text_in(tag, tr, &tst, t::INK.with_alpha(0.8), 0.5);
+            c.rrect(tr, 4.0, t::INK.with_alpha(0.055));
+            c.text_in(&shown, tr, &tst, t::INK.with_alpha(0.8), 0.5);
             x += wdt + 6.0;
         }
         y += 28.0;
@@ -935,5 +988,89 @@ fn wrap(c: &mut Canvas, s: &str, x: f32, mut y: f32, w: f32, bottom: f32, st: &S
     }
     if !line.is_empty() && y <= bottom {
         c.text(&line, x, y, st, col, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::MockHost;
+    use jovian_core::preset::PatchState;
+
+    fn host() -> MockHost {
+        MockHost::new(PatchState { name: "Night Glass".into(), pack: "Custom Bank".into(), ..Default::default() })
+    }
+
+    #[test]
+    fn editing_name_preserves_current_bank() {
+        let host = host();
+        let mut ui = Ui::new(Page::Library, 100);
+        ui.library.focus = Some(NAME);
+        ui.library.name_field.set("  New Name  ");
+        // The bank draft has never been focused and is empty.
+        commit_fields(&mut ui, &host);
+        let (name, bank, _) = host.patch_info();
+        assert_eq!(name, "New Name");
+        assert_eq!(bank, "Custom Bank");
+    }
+
+    #[test]
+    fn editing_bank_ignores_name_draft_from_previous_patch() {
+        let host = host();
+        let mut ui = Ui::new(Page::Library, 100);
+        ui.library.focus = Some(BANK);
+        ui.library.name_field.set("Old Patch");
+        ui.library.bank_field.set("  Live Set  ");
+        commit_fields(&mut ui, &host);
+        let (name, bank, _) = host.patch_info();
+        assert_eq!(name, "Night Glass");
+        assert_eq!(bank, "Live Set");
+    }
+
+    #[test]
+    fn empty_name_draft_preserves_patch_metadata() {
+        let host = host();
+        let mut ui = Ui::new(Page::Library, 100);
+        ui.library.focus = Some(NAME);
+        ui.library.name_field.set("   ");
+        commit_fields(&mut ui, &host);
+        let (name, bank, _) = host.patch_info();
+        assert_eq!(name, "Night Glass");
+        assert_eq!(bank, "Custom Bank");
+    }
+
+    #[test]
+    fn clicking_focused_field_keeps_uncommitted_draft() {
+        let mut ui = Ui::new(Page::Library, 100);
+        ui.patch_name = "Original".into();
+        focus(&mut ui, Some(NAME));
+        ui.library.name_field.set("Uncommitted edit");
+        focus(&mut ui, Some(NAME));
+        assert_eq!(ui.library.name_field.text, "Uncommitted edit");
+    }
+
+    #[test]
+    fn persisted_favorites_are_ready_before_any_star_is_clicked() {
+        let path = std::env::temp_dir().join(format!(
+            "jovian-favorites-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::write(&path, "builtin/Night Glass\n\nbuiltin/Night Glass\n").unwrap();
+        let mut lib = Library::default();
+        lib.entries.push(LibraryEntry {
+            name: "Night Glass".into(),
+            bank: "Jovian-8".into(),
+            source: Source::BuiltIn,
+            path: Default::default(),
+            index: 0,
+            category: "Pad".into(),
+        });
+        lib.favorites_from(&path);
+        lib.filter = Some(Filter::Favorites);
+        assert_eq!(lib.filtered().len(), 1);
+        assert!(lib.is_favorite(&lib.entries[0]));
+        assert_eq!(lib.favorites.as_ref().unwrap().len(), 1);
+        std::fs::remove_file(path).unwrap();
     }
 }

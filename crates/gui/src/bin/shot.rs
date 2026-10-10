@@ -32,7 +32,8 @@ fn render(ui: &mut Ui, host: &MockHost, scale: f32, path: &str) {
     }
     let t3 = t2.elapsed();
     // a fader moved by the host: partial redraw
-    host.set(jovian_core::params::addr::LpfCut, (host.get(jovian_core::params::addr::LpfCut) * 0.9).max(0.05));
+    let cutoff = host.get(jovian_core::params::addr::LpfCut);
+    host.set(jovian_core::params::addr::LpfCut, (cutoff * 0.9).max(0.05));
     ui.tick(host);
     let t4 = std::time::Instant::now();
     {
@@ -42,6 +43,15 @@ fn render(ui: &mut Ui, host: &MockHost, scale: f32, path: &str) {
         ui.render(host, &mut c);
     }
     println!("  partial (one fader) {:.2} ms", t4.elapsed().as_secs_f64() * 1e3);
+    // Timing probes must not change the patch shown in the delivered design captures.
+    host.set(jovian_core::params::addr::LpfCut, cutoff);
+    ui.tick(host);
+    {
+        let fonts_ptr: *const jovian_gui::text::Fonts = &ui.fonts;
+        let fonts = unsafe { &*fonts_ptr };
+        let mut c = Canvas::new(pm.as_mut(), scale, false, fonts);
+        ui.render(host, &mut c);
+    }
     pm.save_png(path).unwrap();
     println!("{path}: first frame {:.1} ms, cached {:.1} ms", t1.as_secs_f64() * 1e3, t3.as_secs_f64() * 1e3);
 }
@@ -62,7 +72,8 @@ fn main() {
     std::fs::create_dir_all(&out).unwrap();
     render(&mut ui, &host, scale, &format!("{out}/synth.png"));
     // hover a fader and a switch
-    ui.event(&host, Event::Move { x: 600.0, y: 420.0, mods: Mods::default() });
+    let cutoff_control = ui.layout.controls.iter().find(|c| c.kind.addr() == Some(jovian_core::params::addr::LpfCut)).unwrap();
+    ui.event(&host, Event::Move { x: cutoff_control.r.cx(), y: cutoff_control.r.cy(), mods: Mods::default() });
     render(&mut ui, &host, scale, &format!("{out}/synth-hover.png"));
     for p in [Page::Mod, Page::Fx, Page::Library] {
         ui.set_page(p);

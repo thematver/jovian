@@ -13,6 +13,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CLAP_WRAPPER_DOWNLOAD_DEPENDENCIES TRUE CACHE BOOL "" FORCE)
 set(CLAP_WRAPPER_BUILD_AUV2 TRUE CACHE BOOL "" FORCE)
 set(CLAP_WRAPPER_DONT_ADD_TARGETS TRUE CACHE BOOL "" FORCE)
+# Installation belongs to Tools/build.sh after every format has built and been signed.
+set(CLAP_WRAPPER_COPY_AFTER_BUILD FALSE CACHE BOOL "" FORCE)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/clap-wrapper ${CMAKE_BINARY_DIR}/clap-wrapper)
 
 if (NOT JOVIAN_STATICLIB)
@@ -38,4 +40,16 @@ target_add_auv2_wrapper(
         MANUFACTURER_CODE "Jovn"
         SUBTYPE_CODE "JV8e"
         INSTRUMENT_TYPE "aumu"
+)
+
+# Reconfiguring an up-to-date Ninja build rewrites the bundle's Info.plist with
+# CMake's generic application template. The wrapper restores its generated AU
+# manifest only in PRE_BUILD, which never runs when no relink is required.
+# Restore the registration metadata on every build, after the helper has run.
+add_custom_target(jovian8_au_metadata ALL
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_BINARY_DIR}/jovian8_auv2-build-helper-output/auv2_Info.plist"
+                "$<TARGET_BUNDLE_DIR:jovian8_auv2>/Contents/Info.plist"
+        DEPENDS jovian8_auv2
+        VERBATIM
 )

@@ -167,8 +167,40 @@ unsafe impl Params for JovianParams {
             *self.patch.write() = p;
         }
         self.generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        if let Some(u) = serialized.get("ui").and_then(|s| serde_json::from_str::<UiState>(s).ok()) {
+        if let Some(mut u) = serialized.get("ui").and_then(|s| serde_json::from_str::<UiState>(s).ok()) {
+            u.zoom = jovian_gui::ui::valid_zoom(u.zoom);
+            u.page = jovian_gui::layout::Page::from_index(u.page).index();
             *self.ui.write() = u;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restored_ui_rejects_unbounded_window_dimensions() {
+        let params = JovianParams::default();
+        for zoom in [0, 1, 151, u32::MAX] {
+            let fields = BTreeMap::from([("ui".to_string(), format!("{{\"zoom\":{zoom},\"page\":4294967295}}"))]);
+            params.deserialize_fields(&fields);
+            let ui = params.ui.read();
+            assert_eq!(ui.zoom, 100);
+            assert_eq!(ui.page, 0);
+            assert_eq!(crate::editor::size_for_zoom(zoom), crate::editor::size_for_zoom(100));
+        }
+    }
+
+    #[test]
+    fn restored_ui_preserves_supported_zoom_and_page() {
+        let params = JovianParams::default();
+        for zoom in jovian_gui::ui::ZOOMS {
+            let fields = BTreeMap::from([("ui".to_string(), format!("{{\"zoom\":{zoom},\"page\":2}}"))]);
+            params.deserialize_fields(&fields);
+            let ui = params.ui.read();
+            assert_eq!(ui.zoom, zoom);
+            assert_eq!(ui.page, 2);
         }
     }
 }

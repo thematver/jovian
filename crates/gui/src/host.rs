@@ -30,6 +30,10 @@ pub trait Host {
     /// loaded (by the editor, a host preset or a project restore).
     fn patch_info(&self) -> (String, String, u64);
     fn meters(&self) -> Meters;
+    /// Latest tempo supplied by the DAW, for synchronized visual previews.
+    fn tempo_bpm(&self) -> f64 {
+        120.0
+    }
     fn compressor_reduction(&self, _slot: usize) -> f32 {
         0.0
     }
