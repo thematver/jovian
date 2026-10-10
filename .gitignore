@@ -8,3 +8,6 @@ Tools/spec.json
 Tools/__pycache__/
 *.wav
 .DS_Store
+third_party/
+target/
+build/

@@ -1,0 +1,11 @@
+[package]
+name = "jovian-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Jovian-8 synthesizer engine, effects and Jup-8 V preset format"
+
+[dependencies]
+miniz_oxide = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

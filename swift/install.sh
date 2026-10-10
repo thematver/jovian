@@ -1,7 +1,7 @@
 #!/bin/zsh
 # Builds Jovian-8, installs it into ~/Applications and registers the Audio Unit.
 set -e
-cd "$(dirname "$0")/../Xcode"
+cd "$(dirname "$0")/Xcode"
 tuist generate --no-open >/dev/null
 xcodebuild -workspace Jovian8.xcworkspace -scheme Jovian8 -configuration Release -derivedDataPath build/DD build | grep -E "error:|BUILD" || true
 BUILT="$PWD/build/DD/Build/Products/Release/Jovian8.app"
