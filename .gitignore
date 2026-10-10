@@ -1,9 +1,9 @@
 .build/
 .swiftpm/
-Xcode/*.xcodeproj
-Xcode/*.xcworkspace
-Xcode/Derived/
-Xcode/build/
+swift/Xcode/*.xcodeproj
+swift/Xcode/*.xcworkspace
+swift/Xcode/Derived/
+swift/Xcode/build/
 Tools/spec.json
 Tools/__pycache__/
 *.wav
