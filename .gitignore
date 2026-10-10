@@ -12,3 +12,4 @@ third_party/
 target/
 build/
 Tools/auhost/auhost
+Tools/aurender/aurender

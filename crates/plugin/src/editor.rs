@@ -170,6 +170,7 @@ struct EditorWindow {
     physical: (u32, u32),
     logical: (f64, f64),
     force: bool,
+    cursor: jovian_gui::Cursor,
 }
 
 impl EditorWindow {
@@ -188,6 +189,7 @@ impl EditorWindow {
             physical: (w * 2, h * 2),
             logical: (w as f64, h as f64),
             force: true,
+            cursor: jovian_gui::Cursor::Default,
         }
     }
 
@@ -242,6 +244,29 @@ impl EditorWindow {
     fn to_ui(&self, p: baseview::Point) -> (f32, f32) {
         let z = self.zoom_factor();
         (p.x as f32 / z, p.y as f32 / z)
+    }
+
+    /// Sets the mouse cursor (baseview does not implement this on macOS).
+    fn update_cursor(&mut self) {
+        let c = self.ui.cursor();
+        if c == self.cursor {
+            return;
+        }
+        self.cursor = c;
+        #[cfg(target_os = "macos")]
+        unsafe {
+            use objc::runtime::Object;
+            use objc::{class, msg_send, sel, sel_impl};
+            let cur: *mut Object = match c {
+                jovian_gui::Cursor::Default => msg_send![class!(NSCursor), arrowCursor],
+                jovian_gui::Cursor::Hand => msg_send![class!(NSCursor), pointingHandCursor],
+                jovian_gui::Cursor::ResizeV => msg_send![class!(NSCursor), resizeUpDownCursor],
+                jovian_gui::Cursor::Text => msg_send![class!(NSCursor), IBeamCursor],
+            };
+            if !cur.is_null() {
+                let _: () = msg_send![cur, set];
+            }
+        }
     }
 
     fn apply_pending(&mut self, window: &mut Window) {
@@ -402,6 +427,7 @@ impl WindowHandler for EditorWindow {
             BvEvent::Window(_) => EventStatus::Ignored,
         };
         self.apply_pending(window);
+        self.update_cursor();
         status
     }
 }

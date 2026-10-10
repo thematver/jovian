@@ -272,7 +272,8 @@ fn fav_key(e: &LibraryEntry) -> String {
     }
 }
 
-/// Rows of the side panel: (label, count, filter or category, indent).
+/// Rows of the side panel.
+#[allow(dead_code)]
 enum SideRow {
     Header(&'static str),
     Filter(&'static str, Filter),
@@ -280,7 +281,7 @@ enum SideRow {
 }
 
 fn side_rows(lib: &Library) -> Vec<SideRow> {
-    let mut v = vec![
+    let v = vec![
         SideRow::Header("SOURCES"),
         SideRow::Filter("All presets", Filter::All),
         SideRow::Filter("Favorites", Filter::Favorites),

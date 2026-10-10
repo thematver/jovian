@@ -475,10 +475,6 @@ fn left_column(l: &mut Layout) {
         Kind::Switch { addr: a::PlPrio, items: texts(&["LO", "HI", "LAST"]), order: vec![0, 1, 2], color: t::RED, vertical: false },
     );
     knob(l, x + 182.0, ry - 2.0, a::VoiceDetuneAmount, "DETUNE", t::RED, false, 15.0);
-    knob(l, x + 226.0, ry + 26.0, a::PanSpread, "SPREAD", t::RED, false, 0.0);
-    // (spread is drawn as a slider; replace the knob just pushed)
-    l.controls.pop();
-    l.decos.pop();
     l.deco(Some(p), Deco::Label { text: "SPREAD", x: lx, y: ry + 87.5, align: 0.0 });
     l.push(Some(p), R::new(bx - 6.0, ry + 75.0, 86.0, 18.0), Kind::HSlider { addr: a::PanSpread, color: t::RED, bipolar: false });
 

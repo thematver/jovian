@@ -305,9 +305,11 @@ impl Ui {
     }
 
     pub fn cursor(&self) -> Cursor {
+        use crate::pages::library::{BANK, NAME, SEARCH};
         match (&self.drag, self.hover.map(|i| &self.layout.controls[i].kind)) {
             (Some(Drag::Value { .. }), _) => Cursor::ResizeV,
             (_, Some(Kind::Fader { .. } | Kind::Knob { .. })) => Cursor::ResizeV,
+            (_, Some(Kind::Area(id))) if [SEARCH, NAME, BANK].contains(id) => Cursor::Text,
             (_, Some(_)) => Cursor::Hand,
             _ => Cursor::Default,
         }
@@ -916,7 +918,17 @@ impl Ui {
         // body
         for (p, d) in &self.layout.decos {
             if p.map_or(true, |p| p == self.page) {
-                draw_deco(c, d);
+                if let Deco::Section { .. } = d {
+                    draw_deco(c, d);
+                }
+            }
+        }
+        grain(c);
+        for (p, d) in &self.layout.decos {
+            if p.map_or(true, |p| p == self.page) {
+                if !matches!(d, Deco::Section { .. }) {
+                    draw_deco(c, d);
+                }
             }
         }
         pages::draw_background(self, c);
@@ -935,6 +947,24 @@ impl Ui {
 
     pub fn is_dragging(&self) -> bool {
         self.drag.is_some()
+    }
+}
+
+/// A faint, fixed grain over the panels (like bead-blasted metal); drawn once into the cache.
+fn grain(c: &mut Canvas) {
+    let w = c.pix.width() as usize;
+    let data = c.pix.data_mut();
+    let mut seed = 0x2545_F491u32;
+    for (i, px) in data.chunks_exact_mut(4).enumerate() {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        // a little coarser than one device pixel, and slightly streaked horizontally
+        let row = (i / w) as u32;
+        let n = ((seed >> 24) as i32 - 128) / 64 + ((row.wrapping_mul(2_654_435_761) >> 30) as i32 - 2) / 2;
+        for ch in px.iter_mut().take(3) {
+            *ch = (*ch as i32 + n).clamp(0, 255) as u8;
+        }
     }
 }
 
