@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor"]
 members = ["crates/core", "crates/cli", "crates/gui", "crates/plugin", "xtask"]
 
 [workspace.package]
@@ -19,3 +20,9 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# nih-plug with a fix for loading damaged CLAP state (see vendor/nih-plug, "Jovian-8:" comments)
+[patch."https://github.com/robbert-vdh/nih-plug.git"]
+nih_plug = { path = "vendor/nih-plug" }
+nih_plug_derive = { path = "vendor/nih-plug/nih_plug_derive" }
+nih_plug_xtask = { path = "vendor/nih-plug/nih_plug_xtask" }
