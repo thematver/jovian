@@ -11,3 +11,4 @@ Tools/__pycache__/
 third_party/
 target/
 build/
+Tools/auhost/auhost

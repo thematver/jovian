@@ -1,5 +1,6 @@
 //! Jovian-8 as a CLAP / VST3 plugin (and AUv2 through clap-wrapper, see `au/`).
 
+pub mod editor;
 pub mod params;
 
 use jovian_core::dsp::{HostTime, Meters, SynthEngine};
@@ -56,6 +57,7 @@ impl Shared {
 pub struct Jovian8 {
     params: Arc<JovianParams>,
     shared: Arc<Shared>,
+    editor_open: Arc<std::sync::atomic::AtomicBool>,
     engine: Box<SynthEngine>,
     prepared: Option<(f32, u32)>,
     mono_l: Vec<f32>,
@@ -67,6 +69,7 @@ impl Default for Jovian8 {
         Jovian8 {
             params: Arc::new(JovianParams::default()),
             shared: Arc::new(Shared::default()),
+            editor_open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             engine: Box::new(SynthEngine::new()),
             prepared: None,
             mono_l: vec![0.0; 4096],
@@ -132,6 +135,10 @@ impl Plugin for Jovian8 {
 
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
+    }
+
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        Some(Box::new(editor::JovianEditor { params: self.params.clone(), shared: self.shared.clone(), open: self.editor_open.clone() }))
     }
 
     fn initialize(&mut self, _layout: &AudioIOLayout, config: &BufferConfig, _context: &mut impl InitContext<Self>) -> bool {

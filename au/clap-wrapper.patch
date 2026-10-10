@@ -1,0 +1,146 @@
+diff --git a/src/detail/auv2/auv2_base_classes.h b/src/detail/auv2/auv2_base_classes.h
+index 2db27a8..1fe99d7 100644
+--- a/src/detail/auv2/auv2_base_classes.h
++++ b/src/detail/auv2/auv2_base_classes.h
+@@ -607,6 +607,9 @@ class WrapAsAUV2 : public ausdk::AUBase,
+   }
+   void param_request_flush() override
+   {
++    // parameter changes from the plugin's own editor: flushed from the view's idle timer when
++    // the host is not processing audio (otherwise the plugin emits them from process())
++    _flushRequested.store(true);
+   }
+ 
+   void latency_changed() override;
+@@ -758,6 +761,9 @@ class WrapAsAUV2 : public ausdk::AUBase,
+   std::shared_ptr<Clap::Plugin> _plugin = nullptr;
+ 
+   std::unique_ptr<Clap::AUv2::ProcessAdapter> _processAdapter;
++  std::atomic<bool> _flushRequested{false};
++  std::atomic<uint64_t> _lastRenderTicks{0};
++  void flushParamsOnMainThread();
+   std::atomic<bool> _initialized = false;
+ 
+   // some info about the wrapped clap
+diff --git a/src/detail/auv2/auv2_shared.h b/src/detail/auv2/auv2_shared.h
+index 04d8789..e6dbefd 100644
+--- a/src/detail/auv2/auv2_shared.h
++++ b/src/detail/auv2/auv2_shared.h
+@@ -33,6 +33,7 @@ typedef struct ui_connection
+   std::function<void(clap_window_t *, uint32_t *)> _registerWindow = nullptr;
+   std::function<void()> _createWindow = nullptr;
+   std::function<void()> _destroyWindow = nullptr;
++  std::function<void()> _idle = nullptr;  // called from the view's timer on the main thread
+ } ui_connection;
+ 
+ }  // namespace free_audio::auv2_wrapper
+diff --git a/src/detail/auv2/wrappedview.asinclude.mm b/src/detail/auv2/wrappedview.asinclude.mm
+index 6734113..8761ce7 100644
+--- a/src/detail/auv2/wrappedview.asinclude.mm
++++ b/src/detail/auv2/wrappedview.asinclude.mm
+@@ -148,6 +148,7 @@ - (id)initWithAUv2:(free_audio::auv2_wrapper::ui_connection *)cont preferredSize
+ - (void)doIdle
+ {
+   // auto gui = ui._plugin->_ext._gui;
++  if (canary && ui._idle) ui._idle();
+ }
+ - (void)viewDidMoveToWindow
+ {
+diff --git a/src/wrapasauv2.cpp b/src/wrapasauv2.cpp
+index ca783d1..7fa2c59 100644
+--- a/src/wrapasauv2.cpp
++++ b/src/wrapasauv2.cpp
+@@ -1,3 +1,4 @@
++#include <mach/mach_time.h>
+ #include "generated_entrypoints.hxx"
+ #include "detail/auv2/process.h"
+ #include <set>
+@@ -808,7 +809,16 @@ OSStatus WrapAsAUV2::GetProperty(AudioUnitPropertyID inID, AudioUnitScope inScop
+ 
+         char buf[200];
+         auto p = (AudioUnitParameterStringFromValue *)(outData);
+-        double value = *p->inValue;
++        // inValue may be NULL, which asks for the parameter's current value
++        double value = 0;
++        if (p->inValue)
++        {
++          value = *p->inValue;
++        }
++        else if (!_plugin->_ext._params->get_value(_plugin->_plugin, p->inParamID, &value))
++        {
++          return kAudioUnitErr_InvalidParameter;
++        }
+         if (_plugin->_ext._params->value_to_text(_plugin->_plugin, p->inParamID, value, buf, 200))
+         {
+           p->outString = CFStringCreateWithCString(NULL, buf, kCFStringEncodingUTF8);
+@@ -848,6 +858,7 @@ OSStatus WrapAsAUV2::GetProperty(AudioUnitPropertyID inID, AudioUnitScope inScop
+           this->_uiIsOpened = true;
+           _plugin->_ext._gui->create(_plugin->_plugin, CLAP_WINDOW_API_COCOA, false);
+         };
++        _uiconn._idle = [this] { this->onIdle(); };
+         _uiconn._destroyWindow = [this]
+         {
+           // this must exist
+@@ -1154,6 +1165,7 @@ OSStatus WrapAsAUV2::Render(AudioUnitRenderActionFlags &inFlags, const AudioTime
+                             UInt32 inFrames)
+ {
+   assert(inFlags == 0);
++  _lastRenderTicks.store(mach_absolute_time(), std::memory_order_relaxed);
+   if (_initialized && (inFlags == 0))
+   {
+     // do the render dance
+@@ -1288,9 +1300,54 @@ void WrapAsAUV2::onEndEdit(clap_id id)
+ #endif
+ }
+ 
++void WrapAsAUV2::flushParamsOnMainThread()
++{
++  if (!_plugin || !_plugin->_ext._params) return;
++  clap_input_events_t in{nullptr, [](const clap_input_events_t *) -> uint32_t { return 0; },
++                         [](const clap_input_events_t *, uint32_t) -> const clap_event_header_t *
++                         { return nullptr; }};
++  clap_output_events_t out{this, [](const clap_output_events_t *list, const clap_event_header_t *ev) -> bool
++                           {
++                             auto self = static_cast<WrapAsAUV2 *>(list->ctx);
++                             if (ev->space_id != CLAP_CORE_EVENT_SPACE_ID) return true;
++                             switch (ev->type)
++                             {
++                               case CLAP_EVENT_PARAM_VALUE:
++                                 self->onPerformEdit(reinterpret_cast<const clap_event_param_value_t *>(ev));
++                                 break;
++                               case CLAP_EVENT_PARAM_GESTURE_BEGIN:
++                                 self->onBeginEdit(reinterpret_cast<const clap_event_param_gesture_t *>(ev)->param_id);
++                                 break;
++                               case CLAP_EVENT_PARAM_GESTURE_END:
++                                 self->onEndEdit(reinterpret_cast<const clap_event_param_gesture_t *>(ev)->param_id);
++                                 break;
++                               default:
++                                 break;
++                             }
++                             return true;
++                           }};
++  auto guarantee_mainthread = _plugin->AlwaysMainThread();
++  _plugin->_ext._params->flush(_plugin->_plugin, &in, &out);
++}
++
+ void WrapAsAUV2::onIdle()
+ {
+   if (!_plugin) return;
++  if (_flushRequested.load())
++  {
++    // only when the audio thread is idle: flush must not run concurrently with process()
++    static mach_timebase_info_data_t tb = []
++    {
++      mach_timebase_info_data_t t;
++      mach_timebase_info(&t);
++      return t;
++    }();
++    uint64_t now = mach_absolute_time();
++    uint64_t last = _lastRenderTicks.load(std::memory_order_relaxed);
++    uint64_t ms = (now - last) * tb.numer / tb.denom / 1000000;
++    _flushRequested.store(false);
++    if (last == 0 || ms > 100) flushParamsOnMainThread();
++  }
+   // run queue stuff
+   queueEvent e;
+   while (this->_queueToUI.pop(e))

@@ -96,6 +96,8 @@ pub struct JovianParams {
     /// Name, bank and the pass-through data of the current patch (values live in `list`).
     pub patch: RwLock<PatchState>,
     pub ui: RwLock<UiState>,
+    /// Incremented whenever a whole patch is loaded (state restore, preset load).
+    pub generation: std::sync::atomic::AtomicU64,
 }
 
 impl Default for JovianParams {
@@ -104,6 +106,7 @@ impl Default for JovianParams {
             list: PARAMS.iter().map(Holder::new).collect(),
             patch: RwLock::new(PatchState::default()),
             ui: RwLock::new(UiState::default()),
+            generation: std::sync::atomic::AtomicU64::new(1),
         }
     }
 }
@@ -163,6 +166,7 @@ unsafe impl Params for JovianParams {
         if let Some(p) = serialized.get("patch").and_then(|s| PatchState::from_json(s)) {
             *self.patch.write() = p;
         }
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         if let Some(u) = serialized.get("ui").and_then(|s| serde_json::from_str::<UiState>(s).ok()) {
             *self.ui.write() = u;
         }
